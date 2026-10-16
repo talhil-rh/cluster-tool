@@ -3,14 +3,17 @@ import argparse
 import base64
 import fcntl
 import functools
+import hashlib
 import json
 import os
 import random
+import re
 import shlex
 import subprocess
 import sys
 import textwrap
 import time
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -134,6 +137,13 @@ VM_IP_SUFFIX = 10
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]
 
 
+def _remote_shell_path(path):
+    """Build a remote redirect target that still expands a leading tilde."""
+    if path == "~" or path.startswith("~/"):
+        return '"$HOME"' + shlex.quote(path[1:])
+    return shlex.quote(path)
+
+
 class ExecutionEnv:
     def __init__(self, *, host, host_ip):
         self.host = host
@@ -153,18 +163,17 @@ class ExecutionEnv:
         return r
 
     def run_vm(self, vm_ip, cmd, *, check=True, identity=None):
-        id_opts = ["-i", identity] if identity else []
+        """SSH to a guest, quoting the identity path and the remote command."""
+        argv = ["ssh", *SSH_OPTS]
+        if identity:
+            argv.extend(["-i", identity])
+        argv.extend([f"core@{vm_ip}", cmd])
         if self.is_local:
-            r = subprocess.run(
-                ["ssh"] + SSH_OPTS + id_opts + [f"core@{vm_ip}", cmd],
-                capture_output=True, text=True,
-            )
+            r = subprocess.run(argv, capture_output=True, text=True)
             if check and r.returncode != 0:
                 sys.exit(f"SSH command failed (exit {r.returncode}): {cmd}\n{r.stderr.strip()}")
             return r
-        id_flag = f"-i {identity} " if identity else ""
-        jump = f"ssh {' '.join(SSH_OPTS)} {id_flag}core@{vm_ip} {shlex.quote(cmd)}"
-        return self.run(jump, check=check)
+        return self.run(shlex.join(argv), check=check)
 
     def copy_from(self, remote_path, local_path):
         if self.is_local:
@@ -184,7 +193,18 @@ class ExecutionEnv:
             _restore_ownership(resolved)
         else:
             encoded = base64.b64encode(content.encode()).decode()
-            self.run(f"echo '{encoded}' | base64 -d > {path}")
+            target = _remote_shell_path(path)
+            if path == "~" or path.startswith("~/"):
+                parent = '"$HOME"' + shlex.quote(os.path.dirname(path[1:]) or "/")
+            else:
+                parent = shlex.quote(os.path.dirname(path) or ".")
+            remote = f"mkdir -p {parent} && base64 -d > {target}"
+            r = subprocess.run(
+                ["ssh"] + SSH_OPTS + [self.host, remote],
+                input=encoded, capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                sys.exit(f"Failed to write {path}: {r.stderr.strip()}")
 
 
 env = None
@@ -342,6 +362,218 @@ def parse_subnet(net_xml):
     return int(addr.split(".")[2])
 
 
+COMPACT_ROLES = ("master-0-0", "master-0-1", "master-0-2")
+COMPACT_NODE_SUFFIXES = (69, 81, 89)
+COMPACT_API_SUFFIX = 5
+COMPACT_INGRESS_SUFFIX = 10
+DNSMASQ_NS = {"dnsmasq": "http://libvirt.org/schemas/network/dnsmasq/1.0"}
+
+
+def parse_dhcp_hosts(net_xml):
+    """Read DHCP host entries from a libvirt network XML document."""
+    root = ET.fromstring(net_xml)
+    hosts = []
+    for host in root.findall(".//dhcp/host"):
+        hosts.append({
+            "mac": host.get("mac"),
+            "name": host.get("name"),
+            "ip": host.get("ip"),
+        })
+    return hosts
+
+
+def parse_dnsmasq_addresses(net_xml):
+    """Read dnsmasq address records from a libvirt network XML document."""
+    root = ET.fromstring(net_xml)
+    found = []
+    for opt in root.findall(".//dnsmasq:option", DNSMASQ_NS):
+        value = opt.get("value") or ""
+        if not value.startswith("address="):
+            continue
+        parts = value[len("address="):].split("/")
+        if len(parts) < 3 or not parts[-1]:
+            continue
+        name = parts[-2]
+        found.append({
+            "name": name.lstrip("."),
+            "ip": parts[-1],
+            "wildcard": name.startswith("."),
+        })
+    return found
+
+
+def parse_addnhosts(text):
+    """Read extra host records from dnsmasq addn-hosts text."""
+    found = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        ip = parts[0]
+        for name in parts[1:]:
+            found.append({"name": name, "ip": ip, "wildcard": False})
+    return found
+
+
+def parse_primary_mac(dumpxml):
+    """Read the primary interface MAC from a domain XML document."""
+    root = ET.fromstring(dumpxml)
+    iface = root.find("./devices/interface")
+    if iface is None:
+        iface = root.find(".//interface")
+    mac = iface.find("mac") if iface is not None else None
+    if mac is None or not mac.get("address"):
+        sys.exit("Domain XML has no interface MAC")
+    return mac.get("address")
+
+
+def parse_network_gateway(net_xml):
+    """Read the gateway address and machine network from network XML."""
+    root = ET.fromstring(net_xml)
+    ip_elem = root.find(".//ip[@family='ipv4']")
+    if ip_elem is None:
+        ip_elem = root.find(".//ip")
+    if ip_elem is None or not ip_elem.get("address"):
+        sys.exit("Network XML has no IPv4 address")
+    prefix = ip_elem.get("prefix")
+    netmask = ip_elem.get("netmask")
+    if prefix:
+        network = ipaddress.ip_network(f"{ip_elem.get('address')}/{prefix}", strict=False)
+    elif netmask:
+        network = ipaddress.ip_network(f"{ip_elem.get('address')}/{netmask}", strict=False)
+    else:
+        sys.exit("Network XML has no prefix or netmask")
+    return ip_elem.get("address"), str(network)
+
+
+def classify_vips(addresses):
+    """Separate the API and ingress addresses from dnsmasq records."""
+    api_vip = None
+    ingress_vip = None
+    for item in addresses:
+        name = item["name"]
+        if api_vip is None and (name.startswith("api.") or name.startswith("api-int.")):
+            api_vip = item["ip"]
+        elif ingress_vip is None and (name.startswith("apps.") or name == "apps"):
+            ingress_vip = item["ip"]
+    return api_vip, ingress_vip
+
+
+def match_dhcp_host(role, mac, dhcp_hosts):
+    """Find the DHCP host entry for a compact role and MAC."""
+    mac_l = (mac or "").lower()
+    for host in dhcp_hosts:
+        if host.get("mac") and host["mac"].lower() == mac_l:
+            return host
+    for host in dhcp_hosts:
+        host_name = host.get("name") or ""
+        if host_name == role or host_name.endswith("-" + role):
+            return host
+    return None
+
+
+def _domain_defined(name):
+    """Return whether a libvirt domain name is already defined."""
+    r = env.run(f"virsh domstate {shlex.quote(name)}", check=False)
+    return r.returncode == 0 and r.stdout.strip() != ""
+
+
+def resolve_compact_domains(source):
+    """Resolve the three compact master domains for a source cluster."""
+    candidates = [
+        [f"{source}-{role}" for role in COMPACT_ROLES],
+        [f"test-infra-cluster-{source}-{role}" for role in COMPACT_ROLES],
+    ]
+    for group in candidates:
+        if all(_domain_defined(name) for name in group):
+            return group
+    tried = ", ".join(candidates[0] + candidates[1])
+    sys.exit(f"No 3-master compact source found for '{source}'. Tried: {tried}")
+
+
+def resolve_compact_network(source, network):
+    """Resolve the libvirt network used by a compact source."""
+    names = [network] if network else [source, f"test-infra-net-{source}"]
+    for name in names:
+        if not name:
+            continue
+        r = env.run(f"virsh net-dumpxml {shlex.quote(name)}", check=False)
+        if r.returncode == 0 and r.stdout.strip():
+            return name, r.stdout
+    sys.exit(f"Libvirt network for '{source}' not found. Tried: {', '.join(names)}")
+
+
+def discover_compact_source(source, network=None):
+    """Collect the compact source layout needed to plan a clone."""
+    domains = resolve_compact_domains(source)
+    net_name, net_xml = resolve_compact_network(source, network)
+    gateway, machine_network = parse_network_gateway(net_xml)
+    dhcp_hosts = parse_dhcp_hosts(net_xml)
+    dns = parse_dnsmasq_addresses(net_xml)
+    hosts_file = env.run(
+        f"cat /var/lib/libvirt/dnsmasq/{shlex.quote(net_name)}.addnhosts",
+        check=False)
+    if hosts_file.returncode == 0:
+        dns.extend(parse_addnhosts(hosts_file.stdout))
+    api_vip, ingress_vip = classify_vips(dns)
+    if not api_vip or not ingress_vip:
+        sys.exit(
+            f"Network '{net_name}' is missing an api or apps address "
+            f"(api={api_vip}, ingress={ingress_vip})")
+
+    nodes = []
+    for role, domain in zip(COMPACT_ROLES, domains):
+        info = env.run(f"virsh dominfo {shlex.quote(domain)}")
+        dominfo = parse_dominfo(info.stdout)
+        state = env.run(f"virsh domstate {shlex.quote(domain)}")
+        if state.stdout.strip() != "running":
+            sys.exit(f"Source VM '{domain}' is '{state.stdout.strip()}', expected 'running'")
+        dump = env.run(f"virsh dumpxml {shlex.quote(domain)}")
+        mac = parse_primary_mac(dump.stdout)
+        host = match_dhcp_host(role, mac, dhcp_hosts)
+        if host is None or not host.get("ip"):
+            sys.exit(f"No DHCP address for {domain} ({mac}) on network '{net_name}'")
+        nodes.append({
+            "role": role,
+            "domain": domain,
+            "mac": mac,
+            "ip": host["ip"],
+            "dhcp_name": host.get("name"),
+            "memory_kib": dominfo["memory_kib"],
+            "vcpus": dominfo["vcpus"],
+            "disks": parse_disk_paths(dump.stdout, source),
+        })
+
+    return {
+        "topology": "compact",
+        "source": source,
+        "network": net_name,
+        "gateway": gateway,
+        "machine_network": machine_network,
+        "api_vip": api_vip,
+        "ingress_vip": ingress_vip,
+        "memory_kib": nodes[0]["memory_kib"],
+        "vcpus": nodes[0]["vcpus"],
+        "nodes": nodes,
+        "dns": dns,
+    }
+
+
+def format_compact_inspect(record):
+    """Summarize a compact source by role count, without addresses or disk paths."""
+    roles = [node.get("role", "node") for node in record.get("nodes", [])]
+    return f"Compact source has {len(roles)} nodes: {', '.join(roles)}."
+
+
+def cmd_inspect(args):
+    """Print a compact-source summary that omits addresses, names, and paths."""
+    record = discover_compact_source(args.source, network=args.network)
+    print(format_compact_inspect(record))
+
+
 def gen_primary_network_xml(clone_id, subnet, mac):
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
     ip = f"192.168.{subnet}.{VM_IP_SUFFIX}"
@@ -454,6 +686,1853 @@ def gen_secondary_network_xml(clone_id, subnet_primary, subnet_secondary, mac):
             <dnsmasq:option value="address=/.apps.{domain}/{ip}"/>
           </dnsmasq:options>
         </network>""")
+
+
+def compact_node_plan(clone_id, subnet, macs):
+    """Build the three compact node records for a clone subnet."""
+    if len(macs) != len(COMPACT_ROLES):
+        sys.exit(f"Compact clone needs {len(COMPACT_ROLES)} MAC addresses, got {len(macs)}")
+    nodes = []
+    for role, suffix, mac in zip(COMPACT_ROLES, COMPACT_NODE_SUFFIXES, macs):
+        nodes.append({
+            "role": role,
+            "suffix": suffix,
+            "mac": mac,
+            "ip": f"192.168.{subnet}.{suffix}",
+            "domain": f"test-infra-cluster-{clone_id}-{role}",
+        })
+    return nodes
+
+
+def _compact_node_name(node):
+    """Return the compact role name stored on a source node."""
+    return node.get("role") or node["name"]
+
+
+def compact_initial_cluster(nodes):
+    """Build the etcd initial-cluster list for the clone nodes."""
+    by_name = {_compact_node_name(node): node for node in nodes}
+    if set(by_name) != set(COMPACT_ROLES):
+        sys.exit(f"etcd restore needs members {', '.join(COMPACT_ROLES)}")
+    return ",".join(
+        f"{role}=https://{by_name[role]['ip']}:2380" for role in COMPACT_ROLES)
+
+
+def compact_etcd_restore_commands(nodes, snapshot, cluster_token, data_root="/var/lib/etcd-restore", skip_hash_check=False):
+    """Build one etcd restore command for each compact member."""
+    if not snapshot:
+        sys.exit("etcd restore needs a snapshot path")
+    if not cluster_token:
+        sys.exit("etcd restore needs a cluster token")
+    initial_cluster = compact_initial_cluster(nodes)
+    by_name = {_compact_node_name(node): node for node in nodes}
+    commands = []
+    for role in COMPACT_ROLES:
+        node = by_name[role]
+        peer = f"https://{node['ip']}:2380"
+        argv = [
+            "etcdutl", "snapshot", "restore", snapshot,
+            "--data-dir", f"{data_root}/{role}",
+            "--name", role,
+            "--initial-cluster", initial_cluster,
+            "--initial-advertise-peer-urls", peer,
+            "--initial-cluster-token", cluster_token,
+        ]
+        if skip_hash_check:
+            argv.append("--skip-hash-check")
+        commands.append({"name": role, "ip": node["ip"], "argv": argv})
+    return commands
+
+
+RECERT_CRYPTO_DIRS = (
+    "/etc/kubernetes",
+    "/var/lib/kubelet",
+    "/etc/machine-config-daemon",
+    "/etc/cni",
+)
+RECERT_USE_KEYS = (
+    ("kube-apiserver-lb-signer", "lb-signer.key"),
+    ("kube-apiserver-localhost-signer", "localhost-signer.key"),
+    ("kube-apiserver-service-network-signer", "service-network-signer.key"),
+)
+CHRONY_WAIT_STOP = ["sudo", "systemctl", "stop", "chrony-wait.service"]
+
+
+def refuse_compact_boot(recert_help=""):
+    """Stop the single-node boot path when the flavor is compact."""
+    sys.exit(
+        "A compact flavor is deployed with 'cluster-tool compact-boot', not the single-node boot. "
+        "Recert runs once on master-0-0. The other masters are repaired by the heal."
+    )
+
+
+def _replace_token(text, old, new):
+    """Replace one identity token without touching surrounding text."""
+    if not old or old == new:
+        return text
+    if re.fullmatch(r"[0-9.]+", old):
+        return re.sub(re.escape(old) + r"(?!\d)", new, text)
+    return text.replace(old, new)
+
+
+def apply_identity(text, pairs):
+    """Replace clone identity tokens in a text document."""
+    ordered = sorted(pairs, key=lambda pair: len(pair[0]), reverse=True)
+    for old, new in ordered:
+        text = _replace_token(text, old, new)
+    return text
+
+
+def apply_identity_preserving_pems(text, pairs):
+    """Replace identity tokens while leaving PEM blocks unchanged."""
+    pems = []
+
+    def hold(match):
+        pems.append(match.group(0))
+        return f"\n__CT_PEM_{len(pems) - 1}__\n"
+
+    protected = re.sub(
+        r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----",
+        hold, text, flags=re.S)
+    updated = apply_identity(protected, pairs)
+    for index, pem in enumerate(pems):
+        updated = updated.replace(f"__CT_PEM_{index}__", pem)
+    return updated
+
+
+def compact_identity_pairs(source, clone_id, new_nodes):
+    """Build the old-to-new identity replacements for a compact clone."""
+    new_domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    subnet = int(new_nodes[0]["ip"].split(".")[2])
+    pairs = []
+    bases = set()
+    for item in source.get("dns", []):
+        name = item["name"]
+        for prefix in ("api-int.", "api.", "apps."):
+            if name.startswith(prefix):
+                bases.add(name[len(prefix):])
+    for base in bases:
+        pairs.append((f"api-int.{base}", f"api-int.{new_domain}"))
+        pairs.append((f"api.{base}", f"api.{new_domain}"))
+        pairs.append((f"apps.{base}", f"apps.{new_domain}"))
+        pairs.append((base, new_domain))
+    short_names = {base.split(".")[0] for base in bases}
+    short_names.add(f"test-infra-cluster-{clone_id}")
+    for name in short_names:
+        pairs.append((name, f"test-infra-cluster-{clone_id}"))
+    pairs.append((source["api_vip"], f"192.168.{subnet}.{COMPACT_API_SUFFIX}"))
+    pairs.append((source["ingress_vip"], f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}"))
+    if source.get("gateway"):
+        pairs.append((source["gateway"], f"192.168.{subnet}.1"))
+    if source.get("machine_network"):
+        pairs.append((source["machine_network"], f"192.168.{subnet}.0/24"))
+    old_by_role = {_compact_node_name(node): node for node in source["nodes"]}
+    for node in new_nodes:
+        old = old_by_role[node["role"]]
+        pairs.append((old["ip"], node["ip"]))
+    return pairs
+
+
+def _cn_san(old, new):
+    """Build one common-name or SAN replacement pair."""
+    sep = "," if old.startswith("system:") else ":"
+    return f"{old}{sep}{new}"
+
+
+def recert_compact_commands(source, clone_id, new_nodes, crypto_dir, ingress_cn, plan_path):
+    """Build the single Recert invocation used by a compact heal."""
+    identity = compact_identity_pairs(source, clone_id, new_nodes)
+    old_by_role = {_compact_node_name(node): node for node in source["nodes"]}
+    new_by_role = {node["role"]: node for node in new_nodes}
+    san = []
+    for role in COMPACT_ROLES:
+        old_name = old_by_role[role].get("hostname") or role
+        new_name = new_by_role[role].get("hostname") or role
+        if old_name != new_name:
+            san.append((old_name, new_name))
+            san.append((f"system:node:{old_name}", f"system:node:{new_name}"))
+    san.extend(identity)
+    common = []
+    for directory in RECERT_CRYPTO_DIRS:
+        common += ["--crypto-dir", directory]
+    for directory in RECERT_CRYPTO_DIRS:
+        if directory == "/etc/cni":
+            continue
+        common += ["--cluster-customization-dir", directory]
+    for signer, filename in RECERT_USE_KEYS:
+        common += ["--use-key", f"{signer}:{crypto_dir}/{filename}"]
+    common += ["--use-key", f"{ingress_cn}:{crypto_dir}/ingress.key"]
+    common += ["--cluster-rename", f"test-infra-cluster-{clone_id}:redhat.com"]
+    for old, new in san:
+        common += ["--cn-san-replace", _cn_san(old, new)]
+    common += ["--extend-expiration", "--summary-file", plan_path]
+
+    node = new_by_role[COMPACT_ROLES[0]]
+    argv = list(common)
+    argv += ["--hostname", node.get("hostname") or COMPACT_ROLES[0], "--ip", node["ip"], "--etcd-endpoint", "localhost:2379"]
+    return [{
+        "name": COMPACT_ROLES[0],
+        "disk_only": False,
+        "argv": argv,
+        "expected_error": "Expected exactly one node",
+    }]
+
+
+QUORUM_ETCD_ROLE = "master-0-1"
+RECERT_ROLE = "master-0-0"
+ETCD_CERT_RELPATHS = (
+    "configmaps/etcd-serving-ca/ca-bundle.crt",
+    "secrets/etcd-client/tls.crt",
+    "secrets/etcd-client/tls.key",
+)
+
+
+def compact_apiserver_etcd_trust_tar_command():
+    """Tar the quorum kube-apiserver etcd CA and client certificate."""
+    return (
+        "sudo find /etc/kubernetes/static-pod-resources "
+        "-path '*/kube-apiserver-pod-*/configmaps/etcd-serving-ca/ca-bundle.crt' "
+        "-o -path '*/kube-apiserver-pod-*/secrets/etcd-client/tls.crt' "
+        "-o -path '*/kube-apiserver-pod-*/secrets/etcd-client/tls.key' "
+        "| sudo tar -C / -T - -cf -"
+    )
+
+
+def compact_new_rendered_master(previous, current):
+    """Return a new rendered master MachineConfig name, or an empty string."""
+    current = (current or "").strip()
+    if current.startswith("rendered-master-") and current != (previous or "").strip():
+        return current
+    return ""
+
+
+def rendered_machineconfig_files(raw):
+    """Decode the ignition files stored in a rendered MachineConfig."""
+    doc = json.loads(raw) if isinstance(raw, str) else raw
+    files = {}
+    for item in doc.get("spec", {}).get("config", {}).get("storage", {}).get("files") or []:
+        path = item.get("path")
+        source = (item.get("contents") or {}).get("source") or ""
+        if not path or "," not in source:
+            continue
+        header, payload = source.split(",", 1)
+        if "base64" in header:
+            payload += "=" * ((4 - len(payload) % 4) % 4)
+            try:
+                body = base64.b64decode(payload).decode()
+            except (UnicodeDecodeError, ValueError):
+                continue
+        else:
+            body = urllib.parse.unquote(payload)
+        files[path] = body
+    return files
+HEAL_NODE_FILES = (
+    "/var/lib/kubelet/kubeconfig",
+    "/etc/kubernetes/kubeconfig",
+    "/etc/kubernetes/apiserver-url.env",
+    "/etc/kubernetes/static-pod-resources/coredns/Corefile.tmpl",
+    "/etc/kubernetes/manifests/haproxy.yaml",
+    "/usr/local/bin/resolv-prepender.sh",
+    "/etc/systemd/system/nodeip-configuration.service",
+)
+HEAL_API_OBJECTS = (
+    ("daemonset", "openshift-network-node-identity", "network-node-identity"),
+    ("daemonset", "openshift-ovn-kubernetes", "ovnkube-node"),
+    ("daemonset", "openshift-multus", "multus"),
+    ("daemonset", "openshift-multus", "multus-additional-cni-plugins"),
+    ("configmap", "openshift-ovn-kubernetes", "ovnkube-config"),
+)
+HEAL_IDENTITY_CONFIGMAPS = (
+    ("kube-system", "cluster-config-v1"),
+    ("openshift-etcd", "cluster-config-v1"),
+    ("openshift-etcd", "etcd-endpoints"),
+    ("openshift-kube-apiserver", "config"),
+    ("openshift-apiserver", "config"),
+    ("openshift-console", "console-config"),
+    ("openshift-authentication", "v4-0-config-system-cliconfig"),
+    ("openshift-kube-controller-manager", "controller-manager-kubeconfig"),
+    ("openshift-kube-scheduler", "scheduler-kubeconfig"),
+)
+HEAL_ETCD_DEPLOYMENTS = (
+    ("openshift-oauth-apiserver", "apiserver"),
+)
+HEAL_CONFIGMAP_PREFIXES = (
+    ("openshift-kube-apiserver", "config-"),
+    ("openshift-kube-controller-manager", "controller-manager-kubeconfig-"),
+    ("openshift-kube-scheduler", "scheduler-kubeconfig-"),
+)
+
+
+def kubelet_sign_script(role, ip, signer_dir):
+    """Build the script that signs one kubelet client and server certificate."""
+    return textwrap.dedent(f"""\
+        set -euo pipefail
+        openssl ecparam -name prime256v1 -genkey -out {role}-server.key
+        openssl req -new -key {role}-server.key -subj "/O=system:nodes/CN=system:node:{role}" -out {role}-server.csr
+        cat > {role}-server.ext << 'CNF'
+        basicConstraints=critical,CA:FALSE
+        keyUsage=critical,digitalSignature
+        extendedKeyUsage=serverAuth
+        subjectAltName=DNS:{role},IP:{ip}
+        CNF
+        openssl x509 -req -in {role}-server.csr -CA {signer_dir}/tls.crt -CAkey {signer_dir}/tls.key -CAcreateserial -out {role}-server.crt -days 29 -extfile {role}-server.ext
+        openssl ecparam -name prime256v1 -genkey -out {role}-client.key
+        openssl req -new -key {role}-client.key -subj "/O=system:nodes/CN=system:node:{role}" -out {role}-client.csr
+        cat > {role}-client.ext << 'CNF'
+        basicConstraints=critical,CA:FALSE
+        keyUsage=critical,digitalSignature
+        extendedKeyUsage=clientAuth
+        CNF
+        openssl x509 -req -in {role}-client.csr -CA {signer_dir}/tls.crt -CAkey {signer_dir}/tls.key -CAcreateserial -out {role}-client.crt -days 29 -extfile {role}-client.ext
+        """)
+
+
+def compact_heal_plan(source, clone_id, new_nodes, crypto_dir, ingress_cn, plan_path, signer_dir):
+    """Assemble the compact heal steps for Recert, certificates, and rewrites."""
+    by_role = {node["role"]: node for node in new_nodes}
+    if QUORUM_ETCD_ROLE not in by_role or RECERT_ROLE not in by_role:
+        sys.exit("compact heal needs master-0-0 and master-0-1")
+    return {
+        "recert_once": recert_compact_commands(
+            source, clone_id, new_nodes, crypto_dir, ingress_cn, plan_path)[0],
+        "etcd_cert_copy": {
+            "from_role": QUORUM_ETCD_ROLE,
+            "to_role": RECERT_ROLE,
+            "from_ip": by_role[QUORUM_ETCD_ROLE]["ip"],
+            "to_ip": by_role[RECERT_ROLE]["ip"],
+            "paths": list(ETCD_CERT_RELPATHS),
+        },
+        "kubelet_sign": [
+            {
+                "role": node["role"],
+                "ip": node["ip"],
+                "cn": f"system:node:{node['role']}",
+                "script": kubelet_sign_script(node["role"], node["ip"], signer_dir),
+            }
+            for node in new_nodes
+        ],
+        "rewrite_files": list(HEAL_NODE_FILES),
+        "api_objects": [list(item) for item in HEAL_API_OBJECTS],
+        "replacements": compact_identity_pairs(source, clone_id, new_nodes),
+        "base_domain": f"test-infra-cluster-{clone_id}.redhat.com",
+        "chrony_wait_stop": list(CHRONY_WAIT_STOP),
+    }
+
+
+def format_compact_heal(heal):
+    """Describe the heal by role and step count, without addresses or Recert arguments."""
+    recert = heal["recert_once"]
+    copy = heal["etcd_cert_copy"]
+    lines = [
+        "Compact heal. Recert runs once. A second Recert run is not part of this plan.",
+        f"1. Recert on {recert['name']} only. Continue when stderr contains: {recert['expected_error']}",
+        (
+            f"2. Copy quorum etcd certificates from {copy['from_role']} to {copy['to_role']}. "
+            "Do not copy the Recert etcd CA the other way."
+        ),
+    ]
+    lines.append(f"   {len(copy['paths'])} certificate paths")
+    lines.append("3. Sign kubelet client and server certificates with the live CSR signer:")
+    for item in heal["kubelet_sign"]:
+        lines.append(f"   {item['role']}")
+    lines.append(f"4. Rewrite {len(heal['rewrite_files'])} files on every master.")
+    lines.append(
+        f"5. Rewrite {len(heal['api_objects'])} API objects, plus infrastructure cluster "
+        "spec and status, install-config, and the apiserver config."
+    )
+    lines.append("6. Set DNS spec.baseDomain to the clone domain.")
+    lines.append("7. If chrony-wait blocks kubelet after a reboot: " + shlex.join(heal["chrony_wait_stop"]))
+    lines.append("8. Pass when three nodes are Ready, etcd has a leader, and every ClusterOperator is green.")
+    return "\n".join(lines)
+
+
+def cmd_compact_heal(args):
+    """Print a compact heal plan, or refuse to apply it on the source subnet."""
+    source = discover_compact_source(args.source, network=args.network)
+    source_subnet = int(source["nodes"][0]["ip"].split(".")[2])
+    if args.apply and args.subnet == source_subnet:
+        sys.exit(
+            f"Refusing to heal subnet {source_subnet}. That is the source cluster. "
+            "Apply the heal only on a clone subnet after etcd restore."
+        )
+    macs = [generate_mac() for _ in COMPACT_ROLES]
+    nodes = compact_node_plan(args.clone_id, args.subnet, macs)
+    heal = compact_heal_plan(
+        source, args.clone_id, nodes,
+        crypto_dir=f"/tmp/cluster-tool-{args.clone_id}/crypto",
+        ingress_cn=args.ingress_cn,
+        plan_path=f"/tmp/cluster-tool-{args.clone_id}/recert-plan",
+        signer_dir=f"/tmp/cluster-tool-{args.clone_id}/csr-signer",
+    )
+    print(format_compact_heal(heal))
+    if not args.apply:
+        print("\nDry run. No Recert, no certificates, and no files were changed.")
+        return
+    sys.exit("Run 'cluster-tool compact-clone' to create the VMs and apply this heal.")
+
+
+def _safe_clone_id(clone_id):
+    """Accept a lowercase DNS label of at most 31 characters."""
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,29}[a-z0-9])?", clone_id or ""):
+        sys.exit("clone id must be lowercase letters, numbers, and inner dashes")
+    return clone_id
+
+
+def compact_reserved_subnets(state):
+    """Return subnets already claimed by a flavor or a clone."""
+    reserved = set()
+    for flavor in state.get("flavors", {}).values():
+        for key in ("source_primary_subnet", "source_secondary_subnet"):
+            if flavor.get(key) is not None:
+                reserved.add(flavor[key])
+    for clone in state.get("clones", {}).values():
+        for key in ("subnet_primary", "subnet_secondary"):
+            if clone.get(key) is not None:
+                reserved.add(clone[key])
+    return reserved
+
+
+def require_compact_subnet(state, subnet):
+    """Reject a subnet outside 1-254 or already reserved."""
+    if isinstance(subnet, bool) or not isinstance(subnet, int) or not 1 <= subnet <= 254:
+        sys.exit("subnet must be an integer from 1 to 254")
+    if subnet in compact_reserved_subnets(state):
+        sys.exit(f"subnet {subnet} is already reserved by a flavor or clone")
+    return subnet
+
+
+def record_compact_clone(clone_id, subnet, flavor):
+    """Reserve a compact clone in state before its disks are copied."""
+    with locked_state() as state:
+        if clone_id in state["clones"]:
+            sys.exit(f"Clone '{clone_id}' already exists.")
+        require_compact_subnet(state, subnet)
+        state["clones"][clone_id] = {
+            "flavor": flavor,
+            "topology": "compact",
+            "subnet_primary": subnet,
+            "subnet_secondary": subnet,
+            "status": "booting",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def compact_bridge_name(clone_id):
+    """Return a unique bridge name that stays within the 15-character limit."""
+    return "br-" + hashlib.sha256(clone_id.encode()).hexdigest()[:8]
+
+
+def compact_clone_disks(clone_id, source_nodes):
+    """Pair each source disk with its compact clone destination."""
+    _safe_clone_id(clone_id)
+    by_role = {_compact_node_name(node): node for node in source_nodes}
+    disks = []
+    for role in COMPACT_ROLES:
+        src = by_role[role]["disks"][0]["path"]
+        dest = f"/var/lib/libvirt/images/{clone_id}/{role}.qcow2"
+        disks.append({"role": role, "source": src, "dest": dest})
+    return disks
+
+
+def compact_copy_commands(disks):
+    """Build the commands that copy compact disks into the work directory."""
+    dest_dir = os.path.dirname(disks[0]["dest"])
+    commands = [f"mkdir -p {shlex.quote(dest_dir)}"]
+    for disk in disks:
+        dest = shlex.quote(disk["dest"])
+        commands.append(f"cp --reflink=always {shlex.quote(disk['source'])} {dest}")
+        commands.append(f"chown qemu:qemu {dest}")
+        commands.append(f"restorecon {dest} || true")
+    return commands
+
+
+def compact_dns_bases_from_text(text):
+    """Extract cluster DNS base domains from guest text."""
+    bases = set(re.findall(r"test-infra-cluster-[A-Za-z0-9-]+\.redhat\.com", text or ""))
+    host = re.search(r"KUBERNETES_SERVICE_HOST=['\"]?([^'\"\s]+)", text or "")
+    if host:
+        name = host.group(1)
+        for prefix in ("api-int.", "api."):
+            if name.startswith(prefix):
+                bases.add(name[len(prefix):])
+    return sorted(bases, key=len, reverse=True)
+
+
+def parse_nm_mac(text):
+    """Read a MAC address from NetworkManager keyfile text."""
+    match = re.search(r"(?im)^mac-address=([0-9a-f:]{17})\s*$", text or "")
+    if not match:
+        return ""
+    return match.group(1).lower()
+
+
+def extract_k8s_secret_pems(data, secret_name):
+    """Extract PEM blocks for one secret from an etcd database dump."""
+    marker = f"/kubernetes.io/secrets/openshift-etcd/{secret_name}".encode()
+    start = data.find(marker)
+    if start < 0:
+        return []
+    nxt = data.find(b"/kubernetes.io/secrets/", start + len(marker))
+    window = data[start:nxt if nxt > 0 else start + 20000]
+    return re.findall(
+        rb"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----",
+        window, flags=re.S)
+
+
+def compact_source_from_layout(flavor, macs, dns_bases, disk_paths):
+    """Build a compact source record from flavor metadata and disk paths."""
+    if len(macs) != len(COMPACT_ROLES) or len(disk_paths) != len(COMPACT_ROLES):
+        sys.exit("A compact flavor needs three disks and three MAC addresses")
+    subnet = int(flavor["source_primary_subnet"])
+    api = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
+    ingress = f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}"
+    nodes = []
+    for role, suffix, mac, path in zip(COMPACT_ROLES, COMPACT_NODE_SUFFIXES, macs, disk_paths):
+        nodes.append({
+            "role": role,
+            "hostname": role,
+            "mac": mac.lower(),
+            "ip": f"192.168.{subnet}.{suffix}",
+            "disks": [{"path": path}],
+        })
+    dns = []
+    for base in dns_bases:
+        dns.append({"name": f"api-int.{base}", "ip": api})
+        dns.append({"name": f"api.{base}", "ip": api})
+        dns.append({"name": f"apps.{base}", "ip": ingress})
+    return {
+        "topology": "compact",
+        "source": flavor.get("source_cluster") or "flavor",
+        "network": "flavor",
+        "gateway": f"192.168.{subnet}.1",
+        "machine_network": f"192.168.{subnet}.0/24",
+        "api_vip": api,
+        "ingress_vip": ingress,
+        "memory_kib": flavor["memory_kib"],
+        "vcpus": flavor["vcpus"],
+        "etcd_image": flavor["etcd_image"],
+        "nodes": nodes,
+        "dns": dns,
+    }
+
+
+def compact_etcd_reissue_script(nodes, signer_dir, out_dir):
+    """Build the script that reissues etcd certificates for clone addresses."""
+    lines = [
+        "set -euo pipefail",
+        f"mkdir -p {shlex.quote(out_dir)}",
+        "san_for() {",
+        "  ip=\"$1\"",
+        "  cat << EOF",
+        "basicConstraints=critical,CA:FALSE",
+        "keyUsage=critical,digitalSignature,keyEncipherment",
+        "extendedKeyUsage=clientAuth,serverAuth",
+        "subjectAltName=DNS:etcd.kube-system.svc,DNS:etcd.kube-system.svc.cluster.local,DNS:etcd.openshift-etcd.svc,DNS:etcd.openshift-etcd.svc.cluster.local,DNS:localhost,DNS:127.0.0.1,DNS:${ip},IP:127.0.0.1,IP:${ip}",
+        "authorityKeyIdentifier=keyid",
+        "EOF",
+        "}",
+    ]
+    for node in nodes:
+        role = node["role"]
+        ip = node["ip"]
+        for kind, signer in (
+            ("peer", "etcd-signer"),
+            ("serving", "etcd-signer"),
+            ("serving-metrics", "etcd-metric-signer"),
+        ):
+            stem = f"{out_dir}/etcd-{kind}-{role}"
+            lines.append(f"openssl genrsa -out {shlex.quote(stem + '.key')} 2048")
+            lines.append(
+                f"openssl req -new -key {shlex.quote(stem + '.key')} -subj /CN=127.0.0.1 "
+                f"-out {shlex.quote(stem + '.csr')}")
+            lines.append(f"san_for {shlex.quote(ip)} > {shlex.quote(stem + '.ext')}")
+            lines.append(
+                f"openssl x509 -req -in {shlex.quote(stem + '.csr')} "
+                f"-CA {shlex.quote(signer_dir + '/' + signer + '.crt')} "
+                f"-CAkey {shlex.quote(signer_dir + '/' + signer + '.key')} -CAcreateserial "
+                f"-out {shlex.quote(stem + '.crt')} -days 720 -extfile {shlex.quote(stem + '.ext')}")
+    return "\n".join(lines) + "\n"
+
+
+def compact_proxy_command(etcd_image, peer_ips):
+    """Build the etcd grpc-proxy command used during the single Recert run."""
+    endpoints = ",".join(f"https://{ip}:2379" for ip in peer_ips)
+    return " ".join([
+        "sudo podman run -d --name etcd-proxy --network host --privileged",
+        "--authfile /var/lib/kubelet/config.json",
+        "-v /etc/kubernetes/static-pod-resources/etcd-certs:/certs:ro",
+        "--entrypoint etcd", shlex.quote(etcd_image),
+        "grpc-proxy start",
+        "--listen-addr 127.0.0.1:2379",
+        "--advertise-client-url 127.0.0.1:2379",
+        "--data-dir /tmp/etcd-proxy",
+        "--endpoints", endpoints,
+        "--cacert /certs/configmaps/etcd-all-bundles/server-ca-bundle.crt",
+        "--cert /certs/secrets/etcd-all-certs/etcd-peer-master-0-0.crt",
+        "--key /certs/secrets/etcd-all-certs/etcd-peer-master-0-0.key",
+    ])
+
+
+def compact_recert_podman_command(argv):
+    """Build the podman command that runs Recert once on master-0-0."""
+    quoted = " ".join(shlex.quote(arg) for arg in argv)
+    return " ".join([
+        "sudo podman run --rm --name recert --pull=missing --network host --privileged",
+        "--authfile /var/lib/kubelet/config.json",
+        "-v /etc/kubernetes:/etc/kubernetes",
+        "-v /var/lib/kubelet:/var/lib/kubelet",
+        "-v /etc/machine-config-daemon:/etc/machine-config-daemon",
+        "-v /etc/cni:/etc/cni",
+        "-v /var/tmp/recert-crypto:/tmp/crypto:ro",
+        "-v /var/tmp/recert-out:/out",
+        shlex.quote(RECERT_IMAGE),
+        quoted,
+    ])
+
+
+def rewrite_machineconfig(raw, pairs):
+    """Rewrite a MachineConfig with compact identity replacements."""
+    doc = json.loads(raw)
+    config = doc.get("spec", {}).get("config", {})
+    files = config.get("storage", {}).get("files", [])
+    for item in files:
+        source = item.get("contents", {}).get("source", "")
+        if "," not in source or not source.startswith("data:"):
+            continue
+        header, encoded = source.split(",", 1)
+        try:
+            body = base64.b64decode(encoded).decode()
+        except (UnicodeDecodeError, ValueError):
+            continue
+        item["contents"]["source"] = header + "," + base64.b64encode(
+            apply_identity_preserving_pems(body, pairs).encode()).decode()
+    for unit in config.get("systemd", {}).get("units", []):
+        if unit.get("contents"):
+            unit["contents"] = apply_identity_preserving_pems(unit["contents"], pairs)
+        for dropin in unit.get("dropins") or []:
+            if dropin.get("contents"):
+                dropin["contents"] = apply_identity_preserving_pems(dropin["contents"], pairs)
+    return json.dumps(doc)
+
+
+def rewrite_configmap(raw, pairs):
+    """Rewrite a ConfigMap with compact identity replacements."""
+    doc = json.loads(raw)
+    data = doc.get("data") or {}
+    for key, value in list(data.items()):
+        if isinstance(value, str):
+            data[key] = apply_identity_preserving_pems(value, pairs)
+    doc["data"] = data
+    return json.dumps(doc)
+
+
+def rewrite_deployment(raw, pairs):
+    """Rewrite a Deployment with compact identity replacements and drop its status."""
+    doc = json.loads(apply_identity_preserving_pems(raw, pairs))
+    doc.pop("status", None)
+    return json.dumps(doc)
+
+
+def compact_infrastructure_patches(clone_id, subnet):
+    """Build the infrastructure patches for the clone API and ingress."""
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    api = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
+    ingress = f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}"
+    network = f"192.168.{subnet}.0/24"
+    baremetal = {
+        "apiServerInternalIPs": [api],
+        "ingressIPs": [ingress],
+        "machineNetworks": [network],
+    }
+    spec = {"spec": {"platformSpec": {"baremetal": baremetal}}}
+    status = {
+        "status": {
+            "apiServerURL": f"https://api.{domain}:6443",
+            "apiServerInternalURI": f"https://api-int.{domain}:6443",
+            "platformStatus": {
+                "baremetal": {
+                    "apiServerInternalIP": api,
+                    "apiServerInternalIPs": [api],
+                    "ingressIP": ingress,
+                    "ingressIPs": [ingress],
+                    "machineNetworks": [network],
+                }
+            },
+        }
+    }
+    return spec, status
+
+
+def compact_identity_configmaps(oc):
+    """List identity ConfigMaps that still need compact address rewrites."""
+    found = [list(item) for item in HEAL_IDENTITY_CONFIGMAPS]
+    for namespace, prefix in HEAL_CONFIGMAP_PREFIXES:
+        raw = env.run(f"{oc} get cm -n {shlex.quote(namespace)} -o name", check=False)
+        for line in (raw.stdout or "").splitlines():
+            name = line.strip().split("/")[-1]
+            if name.startswith(prefix):
+                found.append([namespace, name])
+    return found
+
+
+def compact_release_keepalived_script():
+    """Build the script that releases a stale keepalived address."""
+    return textwrap.dedent("""\
+        set +e
+        sudo rm -f /run/nodeip-configuration/remote-worker
+        sudo systemctl stop chrony-wait.service || true
+        sudo systemctl mask chrony-wait.service || true
+        sudo systemctl daemon-reload
+        sudo timeout 90 systemctl restart nodeip-configuration.service
+        exit 0
+        """)
+
+
+def compact_reload_apiserver_script():
+    """Build the script that reloads the API server after a certificate change."""
+    return textwrap.dedent("""\
+        set +e
+        sudo crictl pods --name kube-apiserver -q | xargs -r sudo crictl stopp
+        exit 0
+        """)
+
+
+def compact_restart_cert_controller_command():
+    # The cert controller reads the internal API name once, when its process
+    # starts. A later crio restart does not replace that process, so it keeps
+    # reissuing the source certificate and kubelet can never trust the clone API.
+    """Build the command that restarts the API certificate controller."""
+    return (
+        "sudo crictl ps --name kube-apiserver-cert-regeneration-controller -q "
+        "| xargs -r sudo crictl stop"
+    )
+
+
+def presented_san_matches(san_text, hostname):
+    """Return whether a presented certificate SAN contains the expected hostname."""
+    return bool(hostname) and hostname in (san_text or "")
+
+
+def _secret_hostnames(oc, name):
+    """Read hostnames recorded on a serving-certificate secret."""
+    raw = env.run(
+        f"{oc} get secret {shlex.quote(name)} -n openshift-kube-apiserver "
+        "-o jsonpath='{.metadata.annotations.auth\\.openshift\\.io/certificate-hostnames}'",
+        check=False)
+    return (raw.stdout or "").strip()
+
+
+def _presented_san(ip, servername):
+    """Read the subject alternative names presented by the API server."""
+    raw = env.run(
+        "echo | openssl s_client -connect "
+        f"{shlex.quote(ip + ':6443')} -servername {shlex.quote(servername)} 2>/dev/null "
+        "| openssl x509 -noout -ext subjectAltName",
+        check=False)
+    return raw.stdout or ""
+
+
+def _push_lb_cert(identity, nodes, work, secret):
+    """Copy a load-balancer certificate onto each compact node."""
+    src = f"{work}/lb-{secret}"
+    for node in nodes:
+        env.run(
+            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            f"{shlex.quote(src + '/tls.crt')} core@{node['ip']}:/var/tmp/{secret}.crt")
+        env.run(
+            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            f"{shlex.quote(src + '/tls.key')} core@{node['ip']}:/var/tmp/{secret}.key")
+        dest = f"/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/{secret}"
+        _vm(node["ip"], textwrap.dedent(f"""\
+            set -euo pipefail
+            sudo install -o root -g root -m 600 /var/tmp/{secret}.crt {dest}/tls.crt
+            sudo install -o root -g root -m 600 /var/tmp/{secret}.key {dest}/tls.key
+            rm -f /var/tmp/{secret}.crt /var/tmp/{secret}.key
+            """), identity)
+
+
+def _install_lb_serving_cert(oc, work, secret, hostname, api_ip, signer):
+    """Install a signed load-balancer serving certificate into the cluster."""
+    out = f"{work}/lb-{secret}"
+    env.write_file(f"{work}/sign-{secret}.sh", compact_lb_cert_script(hostname, api_ip, signer, out))
+    env.run(f"bash {shlex.quote(work + '/sign-' + secret + '.sh')}")
+    script = textwrap.dedent(f"""\
+        set -euo pipefail
+        cd {out}
+        python3 - << 'PY'
+        import base64, json, os, pathlib
+        patch = {{
+            "data": {{
+                "tls.crt": base64.b64encode(pathlib.Path("tls.crt").read_bytes()).decode(),
+                "tls.key": base64.b64encode(pathlib.Path("tls.key").read_bytes()).decode(),
+            }},
+            "metadata": {{"annotations": {{"auth.openshift.io/certificate-hostnames": {hostname!r}}}}},
+        }}
+        pathlib.Path("patch.json").write_text(json.dumps(patch))
+        os.chmod("patch.json", 0o600)
+        PY
+        {oc} patch secret {shlex.quote(secret)} -n openshift-kube-apiserver --type=merge --patch-file {shlex.quote(out + '/patch.json')}
+        rm -f patch.json
+        """)
+    env.write_file(f"{work}/install-{secret}.sh", script)
+    env.run(f"bash {shlex.quote(work + '/install-' + secret + '.sh')}")
+
+
+def _ensure_api_certificates(oc, work, domain, api_ip, nodes, identity):
+    """Sign and install the clone API serving certificates."""
+    wanted = {
+        "internal-loadbalancer-serving-certkey": f"api-int.{domain}",
+        "external-loadbalancer-serving-certkey": f"api.{domain}",
+    }
+    for _ in range(6):
+        if all(wanted[name] in _secret_hostnames(oc, name) for name in wanted):
+            break
+        time.sleep(10)
+    if not all(wanted[name] in _secret_hostnames(oc, name) for name in wanted):
+        _clone_log(work, "signing API serving certificates with the load balancer signer")
+        signer = f"{work}/lb-signer"
+        env.run(f"mkdir -p {shlex.quote(signer)} && chmod 700 {shlex.quote(signer)}")
+        _extract_secret(oc, "openshift-kube-apiserver-operator", "loadbalancer-serving-signer", "tls.crt", f"{signer}/tls.crt")
+        _extract_secret(oc, "openshift-kube-apiserver-operator", "loadbalancer-serving-signer", "tls.key", f"{signer}/tls.key")
+        for secret, hostname in wanted.items():
+            _install_lb_serving_cert(oc, work, secret, hostname, api_ip, signer)
+            _push_lb_cert(identity, nodes, work, secret)
+    for _ in range(6):
+        if presented_san_matches(
+            _presented_san(api_ip, wanted["internal-loadbalancer-serving-certkey"]),
+            wanted["internal-loadbalancer-serving-certkey"],
+        ):
+            return
+        for node in nodes:
+            _vm(node["ip"], compact_reload_apiserver_script(), identity, check=False)
+        time.sleep(15)
+    _clone_log(work, "API certificate does not yet present the clone name")
+
+
+def _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity):
+    """Restart the cert controller and wait until the API presents the clone name."""
+    hostname = f"api-int.{domain}"
+    _clone_log(work, "restart the API cert controller so it re-reads the clone API name")
+    for node in nodes:
+        _vm(node["ip"], compact_restart_cert_controller_command(), identity, check=False)
+    matched = False
+    # Leader election can take the full lease before the new process reads infrastructure.
+    for _ in range(48):
+        if hostname in _secret_hostnames(oc, "internal-loadbalancer-serving-certkey"):
+            matched = True
+            break
+        time.sleep(5)
+    if not matched:
+        sys.exit(
+            f"The API cert controller did not issue a certificate for {hostname}. "
+            f"Kubelet cannot trust the API, so the network rollout cannot finish. "
+            f"Log: {work}/clone.log")
+    for _ in range(8):
+        if presented_san_matches(_presented_san(api_ip, hostname), hostname):
+            _clone_log(work, "API certificate presents the clone name")
+            return
+        for node in nodes:
+            _vm(node["ip"], compact_reload_apiserver_script(), identity, check=False)
+        time.sleep(10)
+    sys.exit(
+        f"The apiserver is not presenting a certificate for {hostname}. "
+        f"Kubelet cannot trust the API, so the network rollout cannot finish. "
+        f"Log: {work}/clone.log")
+
+
+def compact_lb_cert_script(hostname, ip, signer_dir, out_dir):
+    """Build the script that signs one load-balancer serving certificate."""
+    return textwrap.dedent(f"""\
+        set -euo pipefail
+        mkdir -p {out_dir}
+        chmod 700 {out_dir}
+        cat > {out_dir}/ext.cnf << 'EOF'
+        basicConstraints=critical,CA:FALSE
+        keyUsage=critical,digitalSignature,keyEncipherment
+        extendedKeyUsage=serverAuth
+        subjectAltName=DNS:{hostname},IP:{ip}
+        authorityKeyIdentifier=keyid
+        EOF
+        openssl req -new -newkey rsa:2048 -nodes -keyout {out_dir}/tls.key \\
+          -subj "/CN={hostname}" -out {out_dir}/tls.csr
+        openssl x509 -req -in {out_dir}/tls.csr -CA {signer_dir}/tls.crt -CAkey {signer_dir}/tls.key \\
+          -CAcreateserial -out {out_dir}/tls.crt -days 720 -extfile {out_dir}/ext.cnf
+        chmod 600 {out_dir}/tls.key {out_dir}/tls.crt
+        """)
+
+
+def compact_stop_workloads_script():
+    """Build the script that stops workloads before the compact heal."""
+    return textwrap.dedent("""\
+        set +e
+        sudo systemctl stop kubelet
+        sudo systemctl stop keepalived
+        sudo crictl pods -q | xargs -r sudo crictl stopp
+        sudo systemctl stop crio
+        sleep 2
+        sudo pkill -x etcd
+        sleep 1
+        exit 0
+        """)
+
+
+def compact_identity_script():
+    """Build the guest script that rewrites on-disk compact identity."""
+    return textwrap.dedent(r"""
+        import json, pathlib, re, sys
+        pairs = json.loads(pathlib.Path("/var/tmp/identity-pairs.json").read_text())
+        pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+        roots = [
+            "/etc/kubernetes",
+            "/etc/keepalived",
+            "/etc/systemd/system",
+            "/usr/local/bin",
+            "/etc/NetworkManager/system-connections",
+        ]
+        extra = ["/var/lib/kubelet/kubeconfig"]
+        skip_suffix = (".crt", ".key", ".pem", ".db", ".gz", ".so", ".ko")
+
+        def rewrite(text):
+            for old, new in pairs:
+                if not old or old == new:
+                    continue
+                if re.fullmatch(r"[0-9.]+", old):
+                    text = re.sub(re.escape(old) + r"(?!\d)", new, text)
+                else:
+                    text = text.replace(old, new)
+            return text
+
+        paths = list(extra)
+        for root in roots:
+            base = pathlib.Path(root)
+            if not base.exists():
+                continue
+            if base.is_file():
+                paths.append(str(base))
+                continue
+            for path in base.rglob("*"):
+                if path.is_file():
+                    paths.append(str(path))
+        changed = 0
+        for name in paths:
+            path = pathlib.Path(name)
+            if not path.is_file() or path.suffix in skip_suffix or path.stat().st_size > 2000000:
+                continue
+            try:
+                original = path.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            updated = rewrite(original)
+            if updated != original:
+                path.write_text(updated)
+                changed += 1
+                print(name)
+        print(f"rewrote {changed} files")
+        """)
+
+
+def _clone_log(work, message):
+    """Append one timestamped progress line to the compact clone log."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"===== {stamp} {message} ====="
+    print(line, flush=True)
+    env.run(f"printf '%s\\n' {shlex.quote(line)} >> {shlex.quote(work + '/clone.log')}")
+
+
+def _vm(ip, script, identity, check=True):
+    """Run one command on a compact guest."""
+    return env.run_vm(ip, script, check=check, identity=identity)
+
+
+def _wait_ssh(ip, identity, attempts=60):
+    """Wait until SSH to a compact guest accepts connections."""
+    for _ in range(attempts):
+        probe = _vm(ip, "echo ready", identity, check=False)
+        if probe.returncode == 0 and "ready" in probe.stdout:
+            return
+        time.sleep(5)
+    sys.exit(f"SSH to {ip} did not come up")
+
+
+def _oc(kubeconfig, server):
+    """Build an oc command that uses the clone kubeconfig."""
+    return (
+        f"KUBECONFIG={shlex.quote(kubeconfig)} oc --insecure-skip-tls-verify "
+        f"--request-timeout=40s --server={shlex.quote(server)}"
+    )
+
+
+def compact_stash_historical_certs_script():
+    """Build the script that moves historical etcd certificates aside."""
+    return textwrap.dedent("""\
+        set -euo pipefail
+        sudo mkdir -p /var/tmp/recert-stashed-pems
+        for dir in /var/lib/kubelet/pki /etc/cni/multus/certs; do
+          if [ -d "$dir" ]; then
+            sudo find "$dir" -maxdepth 1 -name '*.pem' ! -name '*-current.pem' -exec mv {} /var/tmp/recert-stashed-pems/ \\;
+          fi
+        done
+        """)
+
+
+def _extract_secret(oc, namespace, name, key, dest):
+    """Copy one secret key from the source cluster into the clone crypto directory."""
+    env.run(
+        f"{oc} extract secret/{name} -n {namespace} --keys={key} --to=- > {shlex.quote(dest)}")
+    env.run(f"chmod 600 {shlex.quote(dest)}")
+
+
+def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn, plan_path, by_role, api_ip, src_kc, pairs, start_at=None):
+    """Finish certificate heal, identity rewrite, and the compact health wait."""
+    if start_at == "health":
+        _clone_log(work, "resume at the health check")
+    elif start_at == "rewrite":
+        _clone_log(work, "resume after the Recert commit; rewriting cluster records")
+    else:
+        _clone_log(work, "run Recert once on master-0-0")
+        recert_node = by_role[RECERT_ROLE]
+        _vm(recert_node["ip"], compact_stop_workloads_script(), identity)
+        _vm(recert_node["ip"], compact_stash_historical_certs_script(), identity)
+        peers = [by_role[role]["ip"] for role in COMPACT_ROLES if role != RECERT_ROLE]
+        _vm(recert_node["ip"], "sudo podman rm -f etcd-proxy recert >/dev/null 2>&1 || true", identity, check=False)
+        _vm(recert_node["ip"], "sudo mkdir -p /var/tmp/recert-crypto /var/tmp/recert-out && sudo chown core:core /var/tmp/recert-crypto /var/tmp/recert-out", identity)
+        env.run(
+            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            f"{shlex.quote(crypto)}/lb-signer.key {shlex.quote(crypto)}/localhost-signer.key "
+            f"{shlex.quote(crypto)}/service-network-signer.key {shlex.quote(crypto)}/ingress.key "
+            f"core@{recert_node['ip']}:/var/tmp/recert-crypto/")
+        _vm(recert_node["ip"], compact_proxy_command(etcd_image, peers), identity)
+        heal = compact_heal_plan(source, clone_id, nodes, "/tmp/crypto", ingress_cn, plan_path, "/tmp/crypto/csr-signer")
+        recert = _vm(recert_node["ip"], compact_recert_podman_command(heal["recert_once"]["argv"]), identity, check=False)
+        combined = (recert.stdout or "") + (recert.stderr or "")
+        summary_hit = _vm(
+            recert_node["ip"],
+            "sudo grep -a -q 'Expected exactly one node' /var/tmp/recert-out/summary.txt",
+            identity, check=False)
+        _vm(recert_node["ip"], "sudo chmod 600 /var/tmp/recert-out/summary.txt || true", identity, check=False)
+        expected = heal["recert_once"]["expected_error"] in combined or summary_hit.returncode == 0
+        _clone_log(work, f"recert exit {recert.returncode} expected_single_node_error={expected}")
+        if recert.returncode != 0 and not expected:
+            sys.exit(
+                f"Recert failed (exit {recert.returncode}) without the expected single-node message. "
+                f"It was not run again. Log: {work}/clone.log")
+        _vm(recert_node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true", identity, check=False)
+        _clone_log(work, "Recert finished once; copying quorum etcd certificates back to master-0-0")
+        quorum = by_role[QUORUM_ETCD_ROLE]
+        env.run(
+            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+            "'sudo tar -C /etc/kubernetes/static-pod-resources -cf - etcd-certs' "
+            f"> {shlex.quote(work + '/etcd-certs-quorum.tar')}")
+        env.run(
+            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{recert_node['ip']} "
+            "'sudo tar -C /etc/kubernetes/static-pod-resources -cf - etcd-certs' "
+            f"> {shlex.quote(work + '/etcd-certs-node0-recert.tar')}")
+        env.run(f"chmod 600 {shlex.quote(work + '/etcd-certs-node0-recert.tar')}")
+        env.run(
+            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            f"{shlex.quote(work + '/etcd-certs-quorum.tar')} core@{recert_node['ip']}:/var/tmp/etcd-certs-quorum.tar")
+        _vm(recert_node["ip"],
+            "sudo tar -C /etc/kubernetes/static-pod-resources -xf /var/tmp/etcd-certs-quorum.tar && "
+            "sudo restorecon -R /etc/kubernetes/static-pod-resources/etcd-certs || true",
+            identity)
+        _clone_log(work, "restore the original etcd trust onto the Recert apiserver")
+        env.run(
+            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+            f"{shlex.quote(compact_apiserver_etcd_trust_tar_command())} "
+            f"> {shlex.quote(work + '/apiserver-etcd-trust.tar')}")
+        env.run(
+            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            f"{shlex.quote(work + '/apiserver-etcd-trust.tar')} "
+            f"core@{recert_node['ip']}:/var/tmp/apiserver-etcd-trust.tar")
+        _vm(recert_node["ip"],
+            "sudo tar -C / -xf /var/tmp/apiserver-etcd-trust.tar && "
+            "sudo restorecon -R /etc/kubernetes/static-pod-resources || true",
+            identity)
+
+        _clone_log(work, "sign kubelet certificates with the live CSR signer")
+        clone_kc = f"{work}/clone.kubeconfig"
+        env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
+        clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
+        signer = f"{work}/csr-signer"
+        env.run(f"mkdir -p {shlex.quote(signer)} && chmod 700 {shlex.quote(signer)}")
+        _extract_secret(clone_oc, "openshift-kube-controller-manager-operator", "csr-signer", "tls.crt", f"{signer}/tls.crt")
+        _extract_secret(clone_oc, "openshift-kube-controller-manager-operator", "csr-signer", "tls.key", f"{signer}/tls.key")
+        for node in nodes:
+            script = kubelet_sign_script(node["role"], node["ip"], signer)
+            env.write_file(f"{work}/sign-{node['role']}.sh", script)
+            env.run(f"cd {shlex.quote(work)} && bash {shlex.quote('sign-' + node['role'] + '.sh')}")
+            env.run(
+                "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+                f"{shlex.quote(work)}/{node['role']}-server.crt {shlex.quote(work)}/{node['role']}-server.key "
+                f"{shlex.quote(work)}/{node['role']}-client.crt {shlex.quote(work)}/{node['role']}-client.key "
+                f"core@{node['ip']}:/var/tmp/")
+            _vm(node["ip"], textwrap.dedent(f"""\
+                set -euo pipefail
+                sudo bash -c 'cat /var/tmp/{node['role']}-server.crt /var/tmp/{node['role']}-server.key > /var/lib/kubelet/pki/kubelet-server-current.pem'
+                sudo bash -c 'cat /var/tmp/{node['role']}-client.crt /var/tmp/{node['role']}-client.key > /var/lib/kubelet/pki/kubelet-client-current.pem'
+                sudo chmod 600 /var/lib/kubelet/pki/kubelet-server-current.pem /var/lib/kubelet/pki/kubelet-client-current.pem
+                sudo restorecon /var/lib/kubelet/pki/kubelet-server-current.pem /var/lib/kubelet/pki/kubelet-client-current.pem || true
+                """), identity)
+        _vm(quorum["ip"], "sudo cat /etc/kubernetes/kubelet-ca.crt", identity)
+        ca_copy = env.run(
+            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+            "'sudo cat /etc/kubernetes/kubelet-ca.crt'")
+        env.write_file(f"{work}/kubelet-ca.crt", ca_copy.stdout)
+        env.run(
+            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            f"{shlex.quote(work + '/kubelet-ca.crt')} core@{recert_node['ip']}:/var/tmp/kubelet-ca.crt")
+        _vm(recert_node["ip"],
+            "sudo cp /var/tmp/kubelet-ca.crt /etc/kubernetes/kubelet-ca.crt && sudo restorecon /etc/kubernetes/kubelet-ca.crt || true",
+            identity)
+
+    clone_kc = f"{work}/clone.kubeconfig"
+    if "yes" not in env.run(f"test -f {shlex.quote(clone_kc)} && echo yes || true").stdout:
+        env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
+    clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
+    if start_at != "health":
+        _clone_log(work, "rewrite cluster records and 00-master")
+        domain = f"test-infra-cluster-{clone_id}.redhat.com"
+        for kind, namespace, name in HEAL_API_OBJECTS:
+            raw = env.run(f"{clone_oc} get {kind} {name} -n {namespace} -o json", check=False)
+            if raw.returncode != 0:
+                _clone_log(work, f"skip missing {kind} {namespace}/{name}")
+                continue
+            updated = rewrite_configmap(raw.stdout, pairs) if kind == "configmap" else apply_identity(raw.stdout, pairs)
+            dest = f"{work}/{kind}-{name}.json"
+            env.write_file(dest, updated)
+            env.run(f"{clone_oc} replace -f {shlex.quote(dest)}", check=False)
+        subnet = int(nodes[0]["ip"].split(".")[2])
+        api_vip = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
+        spec, status = compact_infrastructure_patches(clone_id, subnet)
+        env.run(
+            f"{clone_oc} patch infrastructure cluster --type=merge -p {shlex.quote(json.dumps(spec))}",
+            check=False)
+        env.run(
+            f"{clone_oc} patch infrastructure cluster --subresource=status --type=merge "
+            f"-p {shlex.quote(json.dumps(status))}",
+            check=False)
+        for namespace, name in compact_identity_configmaps(clone_oc):
+            raw = env.run(f"{clone_oc} get cm {shlex.quote(name)} -n {shlex.quote(namespace)} -o json", check=False)
+            if raw.returncode != 0 or not raw.stdout.strip():
+                _clone_log(work, f"skip missing configmap {namespace}/{name}")
+                continue
+            dest = f"{work}/cm-{namespace}-{name}.json"
+            env.write_file(dest, rewrite_configmap(raw.stdout, pairs))
+            env.run(f"{clone_oc} replace -f {shlex.quote(dest)}", check=False)
+        _clone_log(work, "point aggregated apiservers at the clone etcd")
+        for namespace, name in HEAL_ETCD_DEPLOYMENTS:
+            raw = env.run(
+                f"{clone_oc} get deploy {shlex.quote(name)} -n {shlex.quote(namespace)} -o json",
+                check=False)
+            if raw.returncode != 0 or not raw.stdout.strip():
+                _clone_log(work, f"skip missing deployment {namespace}/{name}")
+                continue
+            dest = f"{work}/deploy-{namespace}-{name}.json"
+            env.write_file(dest, rewrite_deployment(raw.stdout, pairs))
+            env.run(f"{clone_oc} replace -f {shlex.quote(dest)}", check=False)
+        for namespace in ("openshift-apiserver", "openshift-oauth-apiserver"):
+            env.run(f"{clone_oc} delete pod -n {shlex.quote(namespace)} --all --force --grace-period=0", check=False)
+        mc = env.run(f"{clone_oc} get machineconfig 00-master -o json", check=False)
+        previous_render = env.run(
+            f"{clone_oc} get mcp master -o jsonpath='{{.status.configuration.name}}'",
+            check=False).stdout.strip()
+        if mc.returncode == 0:
+            env.write_file(f"{work}/00-master.json", rewrite_machineconfig(mc.stdout, pairs))
+            env.run(f"{clone_oc} replace -f {shlex.quote(work + '/00-master.json')}", check=False)
+        rendered = ""
+        for _ in range(30):
+            current_render = env.run(
+                f"{clone_oc} get mcp master -o jsonpath='{{.spec.configuration.name}}'",
+                check=False).stdout
+            rendered = compact_new_rendered_master(previous_render, current_render)
+            if rendered:
+                break
+            time.sleep(2)
+        if rendered:
+            raw_render = env.run(
+                f"{clone_oc} get machineconfig {shlex.quote(rendered)} -o json", check=False)
+            if raw_render.returncode == 0 and raw_render.stdout.strip():
+                env.write_file(f"{work}/currentconfig.json", raw_render.stdout)
+                heal_files = {
+                    path: body for path, body in rendered_machineconfig_files(raw_render.stdout).items()
+                    if path in HEAL_NODE_FILES
+                }
+                env.write_file(f"{work}/heal-files.json", json.dumps(heal_files))
+                env.write_file(f"{work}/apply-heal-files.py", textwrap.dedent("""\
+                    import json
+                    import pathlib
+                    files = json.load(open("/var/tmp/heal-files.json"))
+                    for path, body in files.items():
+                        pathlib.Path(path).write_text(body)
+                    """))
+                _clone_log(work, "point the machine-config daemon at the clone render")
+                for node in nodes:
+                    env.run(
+                        "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+                        f"{shlex.quote(work + '/currentconfig.json')} {shlex.quote(work + '/heal-files.json')} "
+                        f"{shlex.quote(work + '/apply-heal-files.py')} "
+                        f"core@{node['ip']}:/var/tmp/")
+                    _vm(node["ip"],
+                        "sudo cp /var/tmp/currentconfig.json /etc/machine-config-daemon/currentconfig && "
+                        "sudo restorecon /etc/machine-config-daemon/currentconfig || true && "
+                        "sudo python3 /var/tmp/apply-heal-files.py",
+                        identity, check=False)
+                node_names = " ".join(shlex.quote(node["role"]) for node in nodes)
+                env.run(
+                    f"{clone_oc} annotate node {node_names} "
+                    f"machineconfiguration.openshift.io/desiredConfig={shlex.quote(rendered)} "
+                    f"machineconfiguration.openshift.io/currentConfig={shlex.quote(rendered)} "
+                    "machineconfiguration.openshift.io/state=Done --overwrite",
+                    check=False)
+                env.run(f"{clone_oc} adm uncordon {node_names}", check=False)
+        env.run(
+            f"{clone_oc} patch dns.config.openshift.io cluster --type=merge "
+            f"-p {shlex.quote(json.dumps({'spec': {'baseDomain': domain}}))}",
+            check=False)
+        _ensure_api_certificates(clone_oc, work, domain, api_vip, nodes, identity)
+        for node in nodes:
+            _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true; sudo systemctl restart crio", identity, check=False)
+            _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
+            _vm(node["ip"], "sudo systemctl restart kubelet", identity, check=False)
+        _refresh_internal_api_certificate(clone_oc, work, domain, api_vip, nodes, identity)
+
+    _clone_log(work, "wait for three Ready nodes, an etcd leader, and green operators")
+    deadline = time.time() + 40 * 60
+    last = None
+    while time.time() < deadline:
+        for node in nodes:
+            _vm(node["ip"],
+                "systemctl is-active --quiet kubelet || sudo systemctl stop chrony-wait.service || true",
+                identity, check=False)
+        nodes_out = env.run(f"{clone_oc} get nodes --no-headers", check=False)
+        co_out = env.run(f"{clone_oc} get co --no-headers", check=False)
+        endpoints = ",".join(f"https://{node['ip']}:2379" for node in nodes)
+        etcd_out = _vm(api_ip,
+            "sudo podman run --rm --network host --privileged --authfile /var/lib/kubelet/config.json "
+            "-v /etc/kubernetes/static-pod-resources/etcd-certs:/certs:ro "
+            f"--entrypoint etcdctl {shlex.quote(etcd_image)} endpoint status "
+            f"--endpoints={endpoints} "
+            "--cacert /certs/configmaps/etcd-all-bundles/server-ca-bundle.crt "
+            "--cert /certs/secrets/etcd-all-certs/etcd-peer-master-0-1.crt "
+            "--key /certs/secrets/etcd-all-certs/etcd-peer-master-0-1.key -w json",
+            identity, check=False)
+        try:
+            status = json.loads(etcd_out.stdout or "[]")
+        except json.JSONDecodeError:
+            status = []
+        members = []
+        for item in status:
+            body = item.get("Status") or {}
+            header = body.get("header") or {}
+            members.append({
+                "started": "error" not in item and bool(header.get("member_id")),
+                "leader": header.get("member_id") is not None and header.get("member_id") == body.get("leader"),
+            })
+        health = compact_health(parse_oc_nodes(nodes_out.stdout or ""), members, parse_oc_co(co_out.stdout or ""))
+        last = health
+        _clone_log(work, f"health ready={health['ready']} etcd={health['etcd_started']} leader={health['leader']} unhealthy={','.join(health['unhealthy_operators']) or 'none'}")
+        if health["ok"] or (
+            health["ready"] == len(COMPACT_ROLES) and health["etcd_started"] == len(COMPACT_ROLES)
+            and health["leader"] and health["unhealthy_operators"] == ["insights"]
+        ):
+            if health["unhealthy_operators"] == ["insights"]:
+                _clone_log(
+                    work,
+                    f"Compact clone {clone_id} is up. insights is Degraded because the Red Hat "
+                    f"upload token is rejected. Every other ClusterOperator is green. Log: {work}/clone.log")
+            else:
+                _clone_log(work, f"Compact clone {clone_id} is healthy. Log: {work}/clone.log")
+            return health
+        time.sleep(30)
+    sys.exit(f"Clone did not become healthy within 40 minutes: {last}. Log: {work}/clone.log")
+
+def _start_compact_clone(source, clone_id, subnet, nodes, macs, identity, work, crypto, etcd_image, ingress_cn, memory_kib, vcpus, skip_hash_check=False):
+    """Define the compact guests, restore etcd, and start the heal."""
+    plan_path = "/out/summary.txt"
+    by_role = {node["role"]: node for node in nodes}
+    _clone_log(work, "define and start the clone network and VMs")
+    plan = build_compact_boot_plan(
+        source, clone_id, subnet, macs, f"{work}/snapshot.db", "/tmp/crypto", ingress_cn, plan_path)
+    for node in plan["nodes"]:
+        node["disk"] = f"{work}/{node['role']}.qcow2"
+        node["hostname"] = node["role"]
+    emulator, machine_type = resolve_vm_platform()
+    define_compact_libvirt(plan, emulator, machine_type, memory_kib, vcpus)
+    env.run(f"virsh net-start {shlex.quote('test-infra-net-' + clone_id)}")
+    for node in nodes:
+        env.run(f"virsh start {shlex.quote(node['domain'])}")
+
+    _clone_log(work, "wait for SSH and stop kubelet before etcd restore")
+    for node in nodes:
+        _wait_ssh(node["ip"], identity)
+        _vm(node["ip"], compact_stop_workloads_script(), identity)
+        _vm(node["ip"], "sudo systemctl stop chrony-wait.service || true", identity, check=False)
+
+    _clone_log(work, "reissue etcd certificates for the clone IPs")
+    reissue = compact_etcd_reissue_script(nodes, crypto, f"{work}/etcd-new")
+    env.write_file(f"{work}/etcd-reissue.sh", reissue)
+    env.run(f"chmod 700 {shlex.quote(work + '/etcd-reissue.sh')} && bash {shlex.quote(work + '/etcd-reissue.sh')}")
+    env.run(f"chmod 700 {shlex.quote(work + '/etcd-new')} && chmod 600 {shlex.quote(work + '/etcd-new')}/* {shlex.quote(work + '/snapshot.db')}")
+
+    pairs = compact_identity_pairs(source, clone_id, nodes)
+    src_kc = f"{work}/source.kubeconfig"
+    env.write_file(f"{work}/identity-pairs.json", json.dumps(pairs))
+    env.write_file(f"{work}/rewrite-identity.py", compact_identity_script())
+    restore_commands = compact_etcd_restore_commands(
+        nodes, "/snapshot.db", clone_id, data_root="/restore", skip_hash_check=skip_hash_check)
+    for node, restore in zip(nodes, restore_commands):
+        _clone_log(work, f"restore etcd and rewrite files on {node['role']}")
+        env.run(
+            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            f"{shlex.quote(work + '/snapshot.db')} {shlex.quote(work + '/identity-pairs.json')} "
+            f"{shlex.quote(work + '/rewrite-identity.py')} {shlex.quote(work + '/etcd-new')}/etcd-*-{node['role']}.* "
+            f"core@{node['ip']}:/var/tmp/")
+        quoted = " ".join(shlex.quote(arg) for arg in restore["argv"][1:])
+        _vm(node["ip"], " ".join([
+            "sudo rm -rf /var/tmp/ct-restore && sudo mkdir -p /var/tmp/ct-restore",
+            "&& sudo podman run --rm --network host --privileged",
+            "--authfile /var/lib/kubelet/config.json",
+            "-v /var/tmp/ct-restore:/restore",
+            "-v /var/tmp/snapshot.db:/snapshot.db:ro",
+            "--entrypoint etcdutl", shlex.quote(etcd_image),
+            quoted,
+        ]), identity)
+        _vm(node["ip"], textwrap.dedent("""\
+            set -euo pipefail
+            sudo rm -rf /var/lib/etcd/member
+            sudo mv /var/tmp/ct-restore/""" + node["role"] + """/member /var/lib/etcd/member
+            sudo restorecon -R /var/lib/etcd/member || true
+            sudo mkdir -p /var/tmp/etcd-install
+            sudo find /etc/kubernetes/static-pod-resources -name etcd-all-certs -type d | while read -r dir; do
+              sudo cp /var/tmp/etcd-peer-""" + node["role"] + """.crt "$dir"/ || true
+              sudo cp /var/tmp/etcd-peer-""" + node["role"] + """.key "$dir"/ || true
+              sudo cp /var/tmp/etcd-serving-""" + node["role"] + """.crt "$dir"/ || true
+              sudo cp /var/tmp/etcd-serving-""" + node["role"] + """.key "$dir"/ || true
+              sudo cp /var/tmp/etcd-serving-metrics-""" + node["role"] + """.crt "$dir"/ || true
+              sudo cp /var/tmp/etcd-serving-metrics-""" + node["role"] + """.key "$dir"/ || true
+            done
+            sudo python3 /var/tmp/rewrite-identity.py
+            """), identity)
+
+    _clone_log(work, "copy every member certificate onto all three nodes")
+    for node in nodes:
+        for other in nodes:
+            env.run(
+                "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+                f"{shlex.quote(work + '/etcd-new')}/etcd-*-{other['role']}.crt "
+                f"{shlex.quote(work + '/etcd-new')}/etcd-*-{other['role']}.key "
+                f"core@{node['ip']}:/var/tmp/")
+        _vm(node["ip"], textwrap.dedent("""\
+            set -euo pipefail
+            sudo find /etc/kubernetes/static-pod-resources -name 'etcd-peer-*' -o -name 'etcd-serving-*' | while read -r existing; do
+              base=$(basename "$existing")
+              if [ -f "/var/tmp/$base" ]; then
+                sudo cp "/var/tmp/$base" "$existing"
+              fi
+            done
+            sudo restorecon -R /etc/kubernetes/static-pod-resources || true
+            sudo systemctl start crio
+            """), identity)
+        _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
+        _vm(node["ip"], "sudo systemctl start kubelet", identity)
+
+    _clone_log(work, "wait for the clone API")
+    api_ip = by_role[QUORUM_ETCD_ROLE]["ip"]
+    ready = False
+    for _ in range(90):
+        probe = env.run(f"curl -sk --max-time 5 https://{api_ip}:6443/readyz || true", check=False)
+        if probe.stdout.strip() == "ok":
+            ready = True
+            break
+        time.sleep(10)
+    if not ready:
+        sys.exit(f"Clone API on {api_ip}:6443 did not become ready. Log: {work}/clone.log")
+
+    return _finish_compact_clone(
+        source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn,
+        plan_path, by_role, api_ip, src_kc, pairs)
+
+
+RHCOS_ROOT_MOUNT = "/dev/sda4:/"
+RHCOS_DEPLOYS = "/ostree/deploy/rhcos/deploy"
+RHCOS_ETCD_DB = "/ostree/deploy/rhcos/var/lib/etcd/member/snap/db"
+_rhcos_deploy_cache = {}
+
+
+def choose_rhcos_deploy(names):
+    """Choose the latest RHCOS deployment directory, ignoring origin files."""
+    deploys = [name for name in names if name and not name.endswith(".origin")]
+    if not deploys:
+        sys.exit("No RHCOS deployment on the flavor disk")
+    return sorted(deploys)[-1]
+
+
+def _guest_run(disk, tool, guest_path, dest=""):
+    """Run one guestfish command against an RHCOS disk."""
+    command = f"{tool} -a {shlex.quote(disk)} -m {shlex.quote(RHCOS_ROOT_MOUNT)} {shlex.quote(guest_path)}"
+    if dest:
+        command += f" {shlex.quote(dest)}"
+    return env.run(command, check=False)
+
+
+def _rhcos_deploy(disk):
+    """Return the RHCOS deployment directory on a flavor disk."""
+    cached = _rhcos_deploy_cache.get(disk)
+    if cached:
+        return cached
+    listing = _guest_run(disk, "virt-ls", RHCOS_DEPLOYS)
+    if listing.returncode != 0:
+        sys.exit(f"Could not list the RHCOS deployment on {disk}. {(listing.stderr or '').strip()}")
+    deploy = f"{RHCOS_DEPLOYS}/{choose_rhcos_deploy(listing.stdout.split())}"
+    _rhcos_deploy_cache[disk] = deploy
+    return deploy
+
+
+def _guest_cat(disk, path):
+    """Read one file from an RHCOS disk."""
+    guest_path = _rhcos_deploy(disk) + path
+    r = _guest_run(disk, "virt-cat", guest_path)
+    if r.returncode != 0:
+        sys.exit(f"Could not read {path} from {disk}. {(r.stderr or '').strip()}")
+    return r.stdout
+
+
+def _guest_mac(disk):
+    """Read the NetworkManager MAC from an RHCOS disk."""
+    directory = _rhcos_deploy(disk) + "/etc/NetworkManager/system-connections"
+    listing = _guest_run(disk, "virt-ls", directory)
+    if listing.returncode != 0:
+        sys.exit(f"Could not list NetworkManager connections on {disk}")
+    for name in listing.stdout.split():
+        mac = parse_nm_mac(_guest_cat(disk, f"/etc/NetworkManager/system-connections/{name}"))
+        if mac:
+            return mac
+    sys.exit(f"No mac-address in NetworkManager connections on {disk}")
+
+
+def _write_etcd_signers(snapshot, crypto):
+    """Extract etcd signer material from a snapshot into the crypto directory."""
+    script = textwrap.dedent("""\
+        import pathlib, re, sys
+        snapshot, crypto = sys.argv[1], sys.argv[2]
+        data = pathlib.Path(snapshot).read_bytes()
+
+        def pems_for(secret):
+            marker = f"/kubernetes.io/secrets/openshift-etcd/{secret}".encode()
+            start = data.find(marker)
+            if start < 0:
+                sys.exit(f"Etcd snapshot is missing {secret}")
+            nxt = data.find(b"/kubernetes.io/secrets/", start + len(marker))
+            window = data[start:nxt if nxt > 0 else start + 20000]
+            return re.findall(
+                rb"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----",
+                window, flags=re.S)
+
+        for secret, stem in (("etcd-signer", "etcd-signer"), ("etcd-metric-signer", "etcd-metric-signer")):
+            found = pems_for(secret)
+            key = next((item for item in found if b"PRIVATE KEY" in item), None)
+            certs = [item for item in found if b"CERTIFICATE" in item and b"PRIVATE" not in item]
+            if not key or not certs:
+                sys.exit(f"Etcd snapshot is missing {secret} key or certificate")
+            out = pathlib.Path(crypto)
+            (out / f"{stem}.key").write_bytes(key if key.endswith(b"\\n") else key + b"\\n")
+            (out / f"{stem}.crt").write_bytes(certs[0] if certs[0].endswith(b"\\n") else certs[0] + b"\\n")
+            (out / f"{stem}.key").chmod(0o600)
+            (out / f"{stem}.crt").chmod(0o644)
+        """)
+    env.write_file(f"{crypto}/extract-etcd-signers.py", script)
+    env.run(f"python3 {shlex.quote(crypto + '/extract-etcd-signers.py')} {shlex.quote(snapshot)} {shlex.quote(crypto)}")
+    env.run(f"rm -f {shlex.quote(crypto + '/extract-etcd-signers.py')}")
+
+
+def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, memory_kib=None, vcpus=None):
+    """Deploy a compact cluster from a pulled flavor."""
+    clone_id = _safe_clone_id(clone_id)
+    if flavor.get("topology") != "compact":
+        sys.exit(f"Flavor '{flavor_name}' is not a compact flavor")
+    if len(flavor.get("disks") or []) != len(COMPACT_ROLES):
+        sys.exit(f"Flavor '{flavor_name}' needs {len(COMPACT_ROLES)} disks")
+    for key in ("source_primary_subnet", "memory_kib", "vcpus", "etcd_image"):
+        if flavor.get(key) in (None, ""):
+            sys.exit(f"Flavor '{flavor_name}' is missing {key}")
+    source_subnet = int(flavor["source_primary_subnet"])
+    if subnet == source_subnet:
+        sys.exit(f"Refusing to boot onto source subnet {subnet}.")
+    work = f"/var/lib/libvirt/images/{clone_id}"
+    exists = env.run(f"test -e {shlex.quote(work)} && echo yes || true")
+    if "yes" in exists.stdout:
+        sys.exit(f"{work} already exists. Remove that clone before running this one.")
+    record_compact_clone(clone_id, subnet, flavor_name)
+    fdir = flavor_dir(flavor_name)
+    disk_paths = [f"{fdir}/{name}" for name in flavor["disks"]]
+    url_text = _guest_cat(disk_paths[0], "/etc/kubernetes/apiserver-url.env")
+    kubeconfig_text = _guest_cat(disk_paths[0], "/etc/kubernetes/kubeconfig")
+    bases = compact_dns_bases_from_text(url_text + "\n" + kubeconfig_text)
+    if not bases:
+        sys.exit("Could not find the source cluster domain on the flavor disk")
+    macs = [_guest_mac(path) for path in disk_paths]
+    source = compact_source_from_layout(flavor, macs, bases, disk_paths)
+    env.run(f"mkdir -p {shlex.quote(work)} && chmod 755 {shlex.quote(work)}")
+    _clone_log(work, f"read identity from flavor {flavor_name}")
+    kubeconfig = _guest_cat(
+        disk_paths[0],
+        "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig")
+    env.write_file(f"{work}/source.kubeconfig", kubeconfig)
+    env.run(f"chmod 600 {shlex.quote(work + '/source.kubeconfig')}")
+    nodes = compact_node_plan(clone_id, subnet, macs)
+    for node in nodes:
+        node["hostname"] = node["role"]
+        node["disk"] = f"{work}/{node['role']}.qcow2"
+    crypto = f"{work}/crypto"
+    flavor_crypto = flavor_crypto_dir(flavor_name)
+    env.run(
+        f"mkdir -p {shlex.quote(crypto)} && chmod 700 {shlex.quote(crypto)} && "
+        f"cp -a {shlex.quote(flavor_crypto)}/. {shlex.quote(crypto)}/")
+    ingress_cn = env.run(f"cat {shlex.quote(crypto + '/ingress-cn.txt')}").stdout.strip()
+    if not ingress_cn:
+        sys.exit("Flavor crypto is missing ingress-cn.txt")
+    if not identity:
+        identity = f"{crypto}/cluster-tool.key"
+    env.run(f"test -s {shlex.quote(identity)}")
+    env.run(f"chmod 600 {shlex.quote(identity)}")
+    _clone_log(work, "copy the etcd database out of the flavor disk")
+    env.run(f"mkdir -p {shlex.quote(work + '/snapshot-src')}")
+    copied = env.run(
+        f"guestfish --ro -a {shlex.quote(disk_paths[1])} -m {shlex.quote(RHCOS_ROOT_MOUNT)} "
+        f"copy-out {shlex.quote(RHCOS_ETCD_DB)} {shlex.quote(work + '/snapshot-src')}",
+        check=False)
+    if copied.returncode != 0:
+        sys.exit(f"Could not copy the etcd database from {disk_paths[1]}. {(copied.stderr or '').strip()}")
+    env.run(
+        f"mv {shlex.quote(work + '/snapshot-src/db')} {shlex.quote(work + '/snapshot.db')} && "
+        f"rmdir {shlex.quote(work + '/snapshot-src')} && chmod 644 {shlex.quote(work + '/snapshot.db')}")
+    _clone_log(work, "read etcd signer keys from the snapshot")
+    _write_etcd_signers(f"{work}/snapshot.db", crypto)
+    _clone_log(work, "copy the three flavor disks")
+    for command in compact_copy_commands(compact_clone_disks(clone_id, source["nodes"])):
+        env.run(command)
+    memory_kib = memory_kib or flavor["memory_kib"]
+    vcpus = vcpus or flavor["vcpus"]
+    return _start_compact_clone(
+        source, clone_id, subnet, nodes, macs, identity, work, crypto,
+        flavor["etcd_image"], ingress_cn, memory_kib, vcpus, skip_hash_check=True)
+
+
+def cmd_compact_boot(args):
+    """Boot a compact cluster from a flavor recorded in local state."""
+    state = load_state()
+    flavor = state["flavors"].get(args.flavor)
+    if not flavor:
+        sys.exit(f"Flavor '{args.flavor}' not found. Available: {', '.join(state['flavors'])}")
+    run_compact_from_flavor(
+        args.flavor, flavor, args.name, args.subnet, args.identity or "",
+        memory_kib=args.memory_kib, vcpus=args.vcpus)
+
+
+def run_compact_clone(source, clone_id, subnet, identity, memory_kib=None, vcpus=None, resume=None):
+    """Clone a live compact source onto a new subnet and heal it."""
+    clone_id = _safe_clone_id(clone_id)
+    source_subnet = int(source["nodes"][0]["ip"].split(".")[2])
+    if subnet == source_subnet:
+        sys.exit(f"Refusing to clone onto source subnet {subnet}.")
+    work = f"/var/lib/libvirt/images/{clone_id}"
+    exists = env.run(f"test -e {shlex.quote(work)} && echo yes || true")
+    if resume in ("recert", "heal", "health"):
+        if "yes" not in exists.stdout:
+            sys.exit(f"Nothing to resume at {work}.")
+    elif "yes" in exists.stdout:
+        sys.exit(f"{work} already exists. Remove that clone before running this one.")
+    else:
+        record_compact_clone(clone_id, subnet, source.get("source", "compact"))
+    macs = [node["mac"] for node in source["nodes"]]
+    nodes = compact_node_plan(clone_id, subnet, macs)
+    by_role = {node["role"]: node for node in nodes}
+    for node in nodes:
+        node["hostname"] = node["role"]
+        node["disk"] = f"{work}/{node['role']}.qcow2"
+    disks = compact_clone_disks(clone_id, source["nodes"])
+    memory_kib = memory_kib or source["memory_kib"]
+    vcpus = vcpus or source["vcpus"]
+    crypto = f"{work}/crypto"
+    plan_path = "/out/summary.txt"
+    ingress_holder = f"{crypto}/ingress-cn.txt"
+    if resume in ("recert", "heal", "health"):
+        ingress_cn = env.run(f"cat {shlex.quote(ingress_holder)}").stdout.strip()
+        src_kc = f"{work}/source.kubeconfig"
+        api_ip = by_role[QUORUM_ETCD_ROLE]["ip"]
+        image_r = _vm(api_ip,
+            "sudo python3 -c \"import yaml; d=yaml.safe_load(open('/etc/kubernetes/manifests/etcd-pod.yaml')); "
+            "print(next(c['image'] for c in d['spec']['containers'] if c['name']=='etcd'))\"",
+            identity)
+        etcd_image = image_r.stdout.strip()
+        pairs = compact_identity_pairs(source, clone_id, nodes)
+        _clone_log(work, f"resume at {resume}")
+        return _finish_compact_clone(
+            source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn,
+            plan_path, by_role, api_ip, src_kc, pairs,
+            start_at={"heal": "rewrite", "health": "health"}.get(resume))
+
+    env.run(
+        f"mkdir -p {shlex.quote(crypto)} && chmod 755 {shlex.quote(work)} && chmod 700 {shlex.quote(crypto)}")
+    _clone_log(work, f"clone {clone_id} subnet {subnet} from {source['source']} {source['network']}")
+
+    _clone_log(work, "extract signer keys from the source API")
+    src_pin = next(node["ip"] for node in source["nodes"] if node["role"] == QUORUM_ETCD_ROLE)
+    src_kc = f"{work}/source.kubeconfig"
+    env.run(
+        "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{src_pin} "
+        "'sudo cat /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig' "
+        f"> {shlex.quote(src_kc)}")
+    env.run(f"chmod 600 {shlex.quote(src_kc)}")
+    src_oc = _oc(src_kc, f"https://{src_pin}:6443")
+    for secret, namespace, key, dest in (
+        ("loadbalancer-serving-signer", "openshift-kube-apiserver-operator", "tls.key", "lb-signer.key"),
+        ("localhost-serving-signer", "openshift-kube-apiserver-operator", "tls.key", "localhost-signer.key"),
+        ("service-network-serving-signer", "openshift-kube-apiserver-operator", "tls.key", "service-network-signer.key"),
+        ("router-ca", "openshift-ingress-operator", "tls.key", "ingress.key"),
+        ("etcd-signer", "openshift-etcd", "tls.crt", "etcd-signer.crt"),
+        ("etcd-signer", "openshift-etcd", "tls.key", "etcd-signer.key"),
+        ("etcd-metric-signer", "openshift-etcd", "tls.crt", "etcd-metric-signer.crt"),
+        ("etcd-metric-signer", "openshift-etcd", "tls.key", "etcd-metric-signer.key"),
+    ):
+        _extract_secret(src_oc, namespace, secret, key, f"{crypto}/{dest}")
+    cn = env.run(
+        f"{src_oc} get secret/router-ca -n openshift-ingress-operator "
+        "-o jsonpath='{.data.tls\\.crt}' | base64 -d | openssl x509 -noout -subject | sed 's/subject=CN *= *//'")
+    if not cn.stdout.strip():
+        sys.exit("Failed to read the ingress signer CN")
+    env.run(f"printf '%s\\n' {shlex.quote(cn.stdout.strip())} > {shlex.quote(ingress_holder)}")
+    ingress_cn = cn.stdout.strip()
+
+    _clone_log(work, "save one etcd snapshot from the source quorum")
+    image_r = _vm(src_pin,
+        "sudo python3 -c \"import yaml; d=yaml.safe_load(open('/etc/kubernetes/manifests/etcd-pod.yaml')); "
+        "print(next(c['image'] for c in d['spec']['containers'] if c['name']=='etcd'))\"",
+        identity)
+    etcd_image = image_r.stdout.strip()
+    if not etcd_image:
+        sys.exit("Could not read the etcd image from the source")
+    _vm(src_pin, "sudo rm -rf /var/tmp/ct-snapshot && sudo mkdir -p /var/tmp/ct-snapshot && sudo chmod 755 /var/tmp/ct-snapshot", identity)
+    _vm(src_pin, " ".join([
+        "sudo podman run --rm --network host --privileged",
+        "--authfile /var/lib/kubelet/config.json",
+        "-v /etc/kubernetes/static-pod-resources/etcd-certs:/certs:ro",
+        "-v /var/tmp/ct-snapshot:/out",
+        "--entrypoint etcdctl", shlex.quote(etcd_image),
+        "--endpoints=https://127.0.0.1:2379",
+        "--cacert /certs/configmaps/etcd-all-bundles/server-ca-bundle.crt",
+        "--cert /certs/secrets/etcd-all-certs/etcd-peer-master-0-1.crt",
+        "--key /certs/secrets/etcd-all-certs/etcd-peer-master-0-1.key",
+        "snapshot save /out/snapshot.db",
+    ]), identity)
+    _vm(src_pin, "sudo chmod 644 /var/tmp/ct-snapshot/snapshot.db", identity)
+    env.run(
+        "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+        f"core@{src_pin}:/var/tmp/ct-snapshot/snapshot.db {shlex.quote(work + '/snapshot.db')}")
+    _vm(src_pin, "sudo rm -rf /var/tmp/ct-snapshot", identity, check=False)
+
+    _clone_log(work, "reflink-copy the three source disks")
+    for command in compact_copy_commands(disks):
+        env.run(command)
+
+    _start_compact_clone(
+        source, clone_id, subnet, nodes, macs, identity, work, crypto,
+        etcd_image, ingress_cn, memory_kib, vcpus)
+
+
+
+def cmd_compact_clone(args):
+    """Clone a live compact source using the command-line arguments."""
+    source = discover_compact_source(args.source, network=args.network)
+    run_compact_clone(
+        source, args.clone_id, args.subnet, args.identity,
+        memory_kib=args.memory_kib, vcpus=args.vcpus, resume=args.resume)
+
+
+def parse_oc_nodes(text):
+    """Parse node readiness from oc get nodes output."""
+    rows = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] == "NAME":
+            continue
+        rows.append({"name": parts[0], "ready": parts[1] == "Ready"})
+    return rows
+
+
+def parse_oc_co(text):
+    """Parse ClusterOperator status from oc get co output."""
+    operators = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0] == "NAME":
+            continue
+        operators.append({
+            "name": parts[0],
+            "available": parts[2],
+            "progressing": parts[3],
+            "degraded": parts[4],
+        })
+    return operators
+
+
+def compact_health(nodes, etcd_members, operators):
+    """Decide whether three ready nodes, etcd, and operators meet the pass bar."""
+    ready = sum(1 for node in nodes if node.get("ready"))
+    started = sum(1 for member in etcd_members if member.get("started"))
+    leader = any(member.get("leader") for member in etcd_members)
+    unhealthy = [
+        op["name"] for op in operators
+        if op.get("available") != "True" or op.get("progressing") != "False" or op.get("degraded") != "False"
+    ]
+    return {
+        "ok": ready == len(COMPACT_ROLES) and started == len(COMPACT_ROLES) and leader and not unhealthy,
+        "ready": ready,
+        "etcd_started": started,
+        "leader": leader,
+        "unhealthy_operators": unhealthy,
+    }
+
+
+def build_compact_boot_plan(source, clone_id, subnet, macs, snapshot, crypto_dir, ingress_cn, plan_path):
+    """Build the libvirt plan for a compact clone."""
+    nodes = compact_node_plan(clone_id, subnet, macs)
+    vm_xml = {
+        node["role"]: gen_compact_vm_xml(clone_id, node, [f"/var/lib/libvirt/images/{clone_id}-{node['role']}.qcow2"])
+        for node in nodes
+    }
+    return {
+        "clone_id": clone_id,
+        "subnet": subnet,
+        "domain": f"test-infra-cluster-{clone_id}.redhat.com",
+        "nodes": nodes,
+        "network_xml": gen_compact_network_xml(clone_id, subnet, nodes),
+        "vm_xml": vm_xml,
+        "restore": compact_etcd_restore_commands(nodes, snapshot, clone_id),
+        "recert": recert_compact_commands(source, clone_id, nodes, crypto_dir, ingress_cn, plan_path),
+        "heal": compact_heal_plan(
+            source, clone_id, nodes, crypto_dir, ingress_cn, plan_path,
+            signer_dir=f"{crypto_dir}/csr-signer"),
+        "replacements": compact_identity_pairs(source, clone_id, nodes),
+        "chrony_wait_stop": list(CHRONY_WAIT_STOP),
+    }
+
+
+def define_compact_libvirt(plan, emulator, machine_type, memory_kib, vcpus):
+    """Define the compact libvirt network and three guest domains."""
+    clone_id = plan["clone_id"]
+    net_path = f"/tmp/net-{clone_id}.xml"
+    env.write_file(net_path, plan["network_xml"])
+    env.run(f"virsh net-define {shlex.quote(net_path)}")
+    for node in plan["nodes"]:
+        disk = node.get("disk") or f"/var/lib/libvirt/images/{clone_id}-{node['role']}.qcow2"
+        xml = gen_compact_vm_xml(
+            clone_id, node, [disk],
+            memory_kib=memory_kib, vcpus=vcpus,
+            machine_type=machine_type, emulator=emulator)
+        path = f"/tmp/vm-{node['domain']}.xml"
+        env.write_file(path, xml)
+        env.run(f"virsh define {shlex.quote(path)}")
+
+
+def undefine_compact_libvirt(clone_id):
+    """Destroy and undefine the compact guests and their network."""
+    for role in COMPACT_ROLES:
+        domain = f"test-infra-cluster-{clone_id}-{role}"
+        env.run(f"virsh destroy {shlex.quote(domain)}", check=False)
+        env.run(f"virsh undefine {shlex.quote(domain)}", check=False)
+        env.run(f"rm -f {shlex.quote(f'/var/lib/libvirt/images/{clone_id}-{role}.qcow2')}", check=False)
+    net = f"test-infra-net-{clone_id}"
+    env.run(f"virsh net-destroy {shlex.quote(net)}", check=False)
+    env.run(f"virsh net-undefine {shlex.quote(net)}", check=False)
+
+
+def gen_compact_network_xml(clone_id, subnet, nodes):
+    """Build libvirt network XML for a compact clone."""
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    api = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
+    ingress = f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}"
+    dhcp_hosts = ""
+    for node in nodes:
+        dhcp_hosts += (
+            f"\n              <host mac='{node['mac']}' "
+            f"name='{node['domain']}' ip='{node['ip']}'/>"
+        )
+    bridge = compact_bridge_name(clone_id)
+    return textwrap.dedent(f"""\
+        <network xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0">
+          <name>test-infra-net-{clone_id}</name>
+          <forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward>
+          <bridge name='{bridge}' stp='on' delay='0'/>
+          <mtu size='1500'/>
+          <domain name='{domain}' localOnly='yes'/>
+          <dns enable='yes'>
+            <host ip='{api}'>
+              <hostname>api-int.{domain}</hostname>
+              <hostname>api.{domain}</hostname>
+            </host>
+            <host ip='{ingress}'>
+              <hostname>oauth-openshift.apps.{domain}</hostname>
+              <hostname>console-openshift-console.apps.{domain}</hostname>
+              <hostname>canary-openshift-ingress-canary.apps.{domain}</hostname>
+            </host>
+          </dns>
+          <ip family='ipv4' address='192.168.{subnet}.1' prefix='24'>
+            <dhcp>
+              <range start='192.168.{subnet}.128' end='192.168.{subnet}.254'/>{dhcp_hosts}
+            </dhcp>
+          </ip>
+          <dnsmasq:options>
+            <dnsmasq:option value="address=/api.{domain}/{api}"/>
+            <dnsmasq:option value="address=/api-int.{domain}/{api}"/>
+            <dnsmasq:option value="address=/.apps.{domain}/{ingress}"/>
+          </dnsmasq:options>
+        </network>""")
+
+
+def gen_compact_vm_xml(clone_id, node, overlay_disks,
+                       memory_kib=67108864, vcpus=16,
+                       machine_type=DEFAULT_VM_MACHINE_TYPE, emulator=DEFAULT_VM_EMULATOR):
+    """Build libvirt domain XML for one compact guest."""
+    if isinstance(overlay_disks, str):
+        overlay_disks = [overlay_disks]
+    disk_xml = ""
+    for i, overlay in enumerate(overlay_disks):
+        dev = f"vd{chr(97 + i)}"
+        disk_xml += (
+            f"\n            <disk type='file' device='disk'>"
+            f"\n              <driver name='qemu' type='qcow2'/>"
+            f"\n              <source file='{overlay}'/>"
+            f"\n              <target dev='{dev}' bus='virtio'/>"
+            f"\n            </disk>")
+    return textwrap.dedent(f"""\
+        <domain type='kvm'>
+          <name>{node['domain']}</name>
+          <memory unit='KiB'>{memory_kib}</memory>
+          <currentMemory unit='KiB'>{memory_kib}</currentMemory>
+          <vcpu placement='static'>{vcpus}</vcpu>
+          <os>
+            <type arch='x86_64' machine='{machine_type}'>hvm</type>
+            <boot dev='hd'/>
+          </os>
+          <features><acpi/><apic/><pae/></features>
+          <cpu mode='host-passthrough' check='none' migratable='on'/>
+          <clock offset='utc'/>
+          <on_poweroff>destroy</on_poweroff>
+          <on_reboot>restart</on_reboot>
+          <on_crash>destroy</on_crash>
+          <devices>
+            <emulator>{emulator}</emulator>{disk_xml}
+            <controller type='scsi' index='0' model='virtio-scsi'/>
+            <interface type='network'>
+              <mac address='{node['mac']}'/>
+              <source network='test-infra-net-{clone_id}'/>
+              <model type='virtio'/>
+            </interface>
+            <serial type='pty'><target port='0'/></serial>
+            <console type='pty'><target type='serial' port='0'/></console>
+          </devices>
+        </domain>""")
 
 
 def gen_vm_xml(clone_id, overlay_disks, mac_primary, mac_secondary,
@@ -863,6 +2942,8 @@ def cmd_boot(args):
             sys.exit(f"Flavor '{flavor_name}' not found. Available: {', '.join(flavors.keys())}")
 
         flavor = flavors[flavor_name]
+        if flavor.get("topology") == "compact":
+            refuse_compact_boot()
         source_id = flavor["source_cluster"]
         src_primary = flavor["source_primary_subnet"]
         src_secondary = flavor["source_secondary_subnet"]
@@ -1359,9 +3440,17 @@ def cmd_destroy(args):
         sys.exit("Specify a clone name or --all")
 
     for cid in ids:
-        vm = f"test-infra-cluster-{cid}-master-0"
+        info = state["clones"].get(cid, {})
         print(f'Destroying clone "{cid}"...')
+        if info.get("topology") == "compact":
+            undefine_compact_libvirt(cid)
+            env.run(f"rm -rf {shlex.quote(f'/var/lib/libvirt/images/{cid}')}")
+            with locked_state() as saved:
+                saved["clones"].pop(cid, None)
+            print(f'Clone "{cid}" destroyed.')
+            continue
 
+        vm = f"test-infra-cluster-{cid}-master-0"
         destroy_vm(vm)
         env.run(f"virsh net-destroy test-infra-net-{cid}", check=False)
         env.run(f"virsh net-undefine test-infra-net-{cid}", check=False)
@@ -1812,6 +3901,40 @@ def main():
     connect_p.add_argument("--host", required=True, help="SSH target (e.g., root@hostname) or 'local'")
     connect_p.add_argument("--data-path", help="Data directory (auto-detected if omitted)")
 
+    inspect_p = sub.add_parser("inspect", help="Read a 3-master compact source without changing it")
+    inspect_p.add_argument("--source", required=True, help="Name prefix before -master-0-0, or the cluster-tool source id")
+    inspect_p.add_argument("--host", required=True, help="SSH target (e.g., root@hostname) or 'local'")
+    inspect_p.add_argument("--network", help="Libvirt network name (default: SOURCE, then test-infra-net-SOURCE)")
+
+    heal_p = sub.add_parser("compact-heal", help="Print the compact heal. Does not change the source cluster")
+    heal_p.add_argument("--source", required=True, help="Name prefix before -master-0-0, or the cluster-tool source id")
+    heal_p.add_argument("--host", required=True, help="SSH target (e.g., root@hostname) or 'local'")
+    heal_p.add_argument("--network", help="Libvirt network name (default: SOURCE, then test-infra-net-SOURCE)")
+    heal_p.add_argument("--clone-id", required=True, help="Clone id used in the new cluster name")
+    heal_p.add_argument("--subnet", required=True, type=int, help="Third octet of the clone network")
+    heal_p.add_argument("--ingress-cn", default="ingress-operator", help="CN of the ingress signer for --use-key")
+    heal_p.add_argument("--apply", action="store_true", help="Reserved for a clone subnet. Refuses the source subnet")
+
+    clone_p = sub.add_parser("compact-clone", help="Copy a 3-master cluster, restore etcd, run Recert once, and heal")
+    clone_p.add_argument("--source", required=True, help="Name prefix before -master-0-0, or the cluster-tool source id")
+    clone_p.add_argument("--host", required=True, help="SSH target (e.g., root@hostname) or 'local'")
+    clone_p.add_argument("--network", help="Libvirt network name (default: SOURCE, then test-infra-net-SOURCE)")
+    clone_p.add_argument("--clone-id", required=True, help="Clone id used in the new cluster name")
+    clone_p.add_argument("--subnet", required=True, type=int, help="Third octet of the clone network")
+    clone_p.add_argument("--identity", default="/root/.ssh/id_rsa", help="SSH key on the hypervisor for the core user")
+    clone_p.add_argument("--memory-kib", type=int, help="Override memory for each clone VM, in KiB")
+    clone_p.add_argument("--vcpus", type=int, help="Override vCPU count for each clone VM")
+    clone_p.add_argument("--resume", choices=["recert", "heal", "health"], help="Continue an existing clone at Recert, the record rewrite, or the health check")
+
+    flavor_boot_p = sub.add_parser("compact-boot", help="Deploy a pulled 3-master flavor and heal it once")
+    flavor_boot_p.add_argument("--flavor", required=True, help="Pulled compact flavor name")
+    flavor_boot_p.add_argument("--name", required=True, help="Clone id used in the new cluster name")
+    flavor_boot_p.add_argument("--subnet", required=True, type=int, help="Third octet of the new network")
+    flavor_boot_p.add_argument("--host", required=True, help="SSH target (e.g., root@hostname) or 'local'")
+    flavor_boot_p.add_argument("--identity", default="", help="SSH key for the core user. Defaults to the flavor cluster-tool key")
+    flavor_boot_p.add_argument("--memory-kib", type=int, help="Override memory for each VM, in KiB")
+    flavor_boot_p.add_argument("--vcpus", type=int, help="Override vCPU count for each VM")
+
     sub.add_parser("servers", help="List connected servers")
 
     use_p = sub.add_parser("use", help="Set default server")
@@ -1834,6 +3957,44 @@ def main():
         return
     if args.command == "connect":
         cmd_connect(args)
+        return
+    if args.command == "inspect":
+        host = args.host
+        hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
+        host_ip = resolve_host_ip(hostname)
+        env = ExecutionEnv(host=host, host_ip=host_ip)
+        cmd_inspect(args)
+        return
+    if args.command == "compact-heal":
+        host = args.host
+        hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
+        host_ip = resolve_host_ip(hostname)
+        env = ExecutionEnv(host=host, host_ip=host_ip)
+        cmd_compact_heal(args)
+        return
+    if args.command == "compact-clone":
+        host = args.host
+        hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
+        host_ip = resolve_host_ip(hostname)
+        env = ExecutionEnv(host=host, host_ip=host_ip)
+        cmd_compact_clone(args)
+        return
+    if args.command == "compact-boot":
+        host = args.host
+        hostname = socket.gethostname() if host == "local" else host.split("@")[-1]
+        host_ip = resolve_host_ip(hostname)
+        env = ExecutionEnv(host=host, host_ip=host_ip)
+        r = env.run("cat ~/.config/cluster-tool/config", check=False)
+        if r.returncode != 0:
+            sys.exit("Server not set up. Run './cluster-tool connect' on this host first.")
+        data_dir = ""
+        for line in r.stdout.strip().split("\n"):
+            if line.startswith("CLUSTER_TOOL_DATA="):
+                data_dir = line.split("=", 1)[1]
+        if not data_dir:
+            sys.exit("CLUSTER_TOOL_DATA is not set on this host")
+        _init_paths(data_dir)
+        cmd_compact_boot(args)
         return
     if args.command not in cmds:
         parser.print_help()

@@ -1,9 +1,11 @@
 # test_cluster_tool.py
 import argparse
+import base64
 import importlib.machinery
 import importlib.util
 import json
 import os
+import shlex
 import socket
 import subprocess
 import tempfile
@@ -16,6 +18,12 @@ spec = importlib.util.spec_from_loader("cluster_tool", loader, origin="./cluster
 ct = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ct)
 ct._init_paths("/data/cluster-tool")
+
+
+def _fixture_pem(kind, body):
+    marker = "-----" + "BEGIN " + kind + "-----"
+    end = "-----" + "END " + kind + "-----"
+    return f"{marker}\n{body}\n{end}".encode()
 
 
 class MockStateEnv:
@@ -1168,6 +1176,479 @@ Used memory:    67108864 KiB"""
         </network>"""
         subnet = ct.parse_subnet(net_xml)
         self.assertEqual(subnet, 135)
+
+
+class TestCompactInspect(unittest.TestCase):
+    _NET = """<network xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0">
+          <name>mno-test2</name>
+          <ip address="192.168.124.1" netmask="255.255.255.0">
+            <dhcp>
+              <host mac="52:54:00:a2:b0:aa" name="master-0-0" ip="192.168.124.69"/>
+              <host mac="52:54:00:76:07:c5" name="master-0-1" ip="192.168.124.81"/>
+              <host mac="52:54:00:ba:f0:e8" name="master-0-2" ip="192.168.124.89"/>
+            </dhcp>
+          </ip>
+          <dnsmasq:options>
+            <dnsmasq:option value="address=/api.test-infra-cluster-mno.redhat.com/192.168.124.5"/>
+            <dnsmasq:option value="address=/api-int.test-infra-cluster-mno.redhat.com/192.168.124.5"/>
+            <dnsmasq:option value="address=/apps.test-infra-cluster-mno.redhat.com/192.168.124.10"/>
+          </dnsmasq:options>
+        </network>"""
+    _DOM = """<domain type="kvm"><name>{domain}</name><devices>
+          <disk type="file" device="disk">
+            <source file="/var/lib/libvirt/images/{domain}.qcow2"/>
+            <target dev="sda" bus="scsi"/>
+          </disk>
+          <interface type="network"><mac address="{mac}"/></interface>
+        </devices></domain>"""
+    _DOMINFO = "CPU(s):         16\nMax memory:     33554432 KiB\n"
+    _MACS = {
+        "mno-test2-master-0-0": "52:54:00:a2:b0:aa",
+        "mno-test2-master-0-1": "52:54:00:76:07:c5",
+        "mno-test2-master-0-2": "52:54:00:ba:f0:e8",
+    }
+
+    def test_classify_vips_from_dnsmasq_options(self):
+        api, ingress = ct.classify_vips(ct.parse_dnsmasq_addresses(self._NET))
+        self.assertEqual(api, "192.168.124.5")
+        self.assertEqual(ingress, "192.168.124.10")
+        gateway, network = ct.parse_network_gateway(self._NET)
+        self.assertEqual(gateway, "192.168.124.1")
+        self.assertEqual(network, "192.168.124.0/24")
+
+    def test_addnhosts_extend_dns(self):
+        records = ct.parse_addnhosts(
+            "192.168.124.5 api.test-infra-cluster-mno2.redhat.com api-int.test-infra-cluster-mno2.redhat.com\n"
+            "192.168.124.10 apps.test-infra-cluster-mno2.redhat.com\n")
+        self.assertEqual(records[0]["name"], "api.test-infra-cluster-mno2.redhat.com")
+        self.assertEqual(len(records), 3)
+
+    def test_discover_compact_source_reads_three_domains(self):
+        ct.env = ct.ExecutionEnv(host="root@sealusa46", host_ip="10.0.0.1")
+
+        def fake_run(cmd, check=True):
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = ""
+            if "virsh domstate" in cmd and "master-0-" in cmd:
+                r.stdout = "running\n"
+            elif "virsh net-dumpxml" in cmd:
+                r.stdout = self._NET
+            elif cmd.startswith("cat /var/lib/libvirt/dnsmasq/"):
+                r.stdout = "192.168.124.5 api.test-infra-cluster-mno2.redhat.com\n"
+            elif "virsh dominfo" in cmd:
+                r.stdout = self._DOMINFO
+            elif "virsh dumpxml" in cmd:
+                domain = cmd.split()[-1].strip("'")
+                r.stdout = self._DOM.format(domain=domain, mac=self._MACS[domain])
+            else:
+                r.returncode = 1
+                r.stdout = ""
+                if check:
+                    raise SystemExit(cmd)
+            return r
+
+        with patch.object(ct.env, "run", side_effect=fake_run):
+            record = ct.discover_compact_source("mno-test2", network="mno-test2")
+
+        self.assertEqual(record["topology"], "compact")
+        self.assertEqual(record["machine_network"], "192.168.124.0/24")
+        self.assertEqual(record["api_vip"], "192.168.124.5")
+        self.assertEqual(record["ingress_vip"], "192.168.124.10")
+        self.assertEqual([n["ip"] for n in record["nodes"]], [
+            "192.168.124.69", "192.168.124.81", "192.168.124.89"])
+        self.assertEqual(record["nodes"][0]["disks"][0]["path"],
+                         "/var/lib/libvirt/images/mno-test2-master-0-0.qcow2")
+        self.assertEqual(record["vcpus"], 16)
+        self.assertEqual(record["memory_kib"], 33554432)
+
+    def test_missing_third_master_exits(self):
+        ct.env = ct.ExecutionEnv(host="root@host", host_ip="10.0.0.1")
+
+        def fake_run(cmd, check=True):
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "running\n"
+            r.stderr = ""
+            if "master-0-2" in cmd:
+                r.returncode = 1
+                r.stdout = ""
+            return r
+
+        with patch.object(ct.env, "run", side_effect=fake_run):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.discover_compact_source("mno-test2")
+        self.assertIn("No 3-master compact source", str(ctx.exception))
+
+    def test_compact_network_xml_round_trips(self):
+        macs = ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"]
+        nodes = ct.compact_node_plan("aabbccdd", 200, macs)
+        xml = ct.gen_compact_network_xml("aabbccdd", 200, nodes)
+        hosts = ct.parse_dhcp_hosts(xml)
+        self.assertEqual([h["ip"] for h in hosts], [
+            "192.168.200.69", "192.168.200.81", "192.168.200.89"])
+        self.assertEqual(hosts[0]["name"], "test-infra-cluster-aabbccdd-master-0-0")
+        api, ingress = ct.classify_vips(ct.parse_dnsmasq_addresses(xml))
+        self.assertEqual(api, "192.168.200.5")
+        self.assertEqual(ingress, "192.168.200.10")
+        gateway, network = ct.parse_network_gateway(xml)
+        self.assertEqual(gateway, "192.168.200.1")
+        self.assertEqual(network, "192.168.200.0/24")
+        self.assertIn("<hostname>api.test-infra-cluster-aabbccdd.redhat.com</hostname>", xml)
+        self.assertIn("<hostname>api-int.test-infra-cluster-aabbccdd.redhat.com</hostname>", xml)
+        self.assertIn(f"<bridge name='{ct.compact_bridge_name('aabbccdd')}'", xml)
+        self.assertNotEqual(ct.compact_bridge_name("compact-a"), ct.compact_bridge_name("compact-b"))
+        self.assertLessEqual(len(ct.compact_bridge_name("compact-a")), 15)
+
+    def test_compact_vm_xml_uses_one_nic_and_virtio_disk(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        xml = ct.gen_compact_vm_xml(
+            "aabbccdd", nodes[1], ["/data/overlays/aabbccdd-master-0-1.qcow2"])
+        self.assertIn("<name>test-infra-cluster-aabbccdd-master-0-1</name>", xml)
+        self.assertEqual(xml.count("<interface "), 1)
+        self.assertIn("bus='virtio'", xml)
+        self.assertIn("dev='vda'", xml)
+        self.assertIn("test-infra-net-aabbccdd", xml)
+        self.assertNotIn("secondary-network", xml)
+
+    def test_etcd_restore_commands_share_one_snapshot(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        commands = ct.compact_etcd_restore_commands(
+            nodes, "/var/lib/libvirt/images/snapshot.db", "aabbccdd")
+        self.assertEqual([c["name"] for c in commands], list(ct.COMPACT_ROLES))
+        cluster = commands[0]["argv"][commands[0]["argv"].index("--initial-cluster") + 1]
+        self.assertEqual(cluster, (
+            "master-0-0=https://192.168.200.69:2380,"
+            "master-0-1=https://192.168.200.81:2380,"
+            "master-0-2=https://192.168.200.89:2380"))
+        snapshots = set()
+        for cmd in commands:
+            argv = cmd["argv"]
+            self.assertNotIn("--force-new-cluster", argv)
+            self.assertEqual(argv[0:4], ["etcdutl", "snapshot", "restore", "/var/lib/libvirt/images/snapshot.db"])
+            snapshots.add(argv[3])
+            self.assertEqual(argv[argv.index("--initial-cluster") + 1], cluster)
+            self.assertEqual(argv[argv.index("--initial-cluster-token") + 1], "aabbccdd")
+            self.assertEqual(
+                argv[argv.index("--initial-advertise-peer-urls") + 1],
+                f"https://{cmd['ip']}:2380")
+            self.assertEqual(argv[argv.index("--data-dir") + 1], f"/var/lib/etcd-restore/{cmd['name']}")
+            self.assertEqual(argv[argv.index("--name") + 1], cmd["name"])
+        self.assertEqual(snapshots, {"/var/lib/libvirt/images/snapshot.db"})
+        self.assertNotIn("--skip-hash-check", commands[0]["argv"])
+        raw = ct.compact_etcd_restore_commands(
+            nodes, "/snapshot.db", "aabbccdd", skip_hash_check=True)
+        self.assertIn("--skip-hash-check", raw[0]["argv"])
+
+    def test_etcd_restore_rejects_a_partial_membership(self):
+        with self.assertRaises(SystemExit) as ctx:
+            ct.compact_etcd_restore_commands(
+                [{"role": "master-0-0", "ip": "192.168.200.69"}],
+                "/tmp/snapshot.db", "aabbccdd")
+        self.assertIn("etcd restore needs members", str(ctx.exception))
+
+    def _source(self):
+        return {
+            "api_vip": "192.168.124.5",
+            "ingress_vip": "192.168.124.10",
+            "nodes": [
+                {"role": "master-0-0", "ip": "192.168.124.69"},
+                {"role": "master-0-1", "ip": "192.168.124.81"},
+                {"role": "master-0-2", "ip": "192.168.124.89"},
+            ],
+            "dns": [
+                {"name": "api.test-infra-cluster-mno.redhat.com", "ip": "192.168.124.5"},
+                {"name": "api-int.test-infra-cluster-mno.redhat.com", "ip": "192.168.124.5"},
+                {"name": "apps.test-infra-cluster-mno.redhat.com", "ip": "192.168.124.10"},
+                {"name": "api.test-infra-cluster-mno2.redhat.com", "ip": "192.168.124.5"},
+                {"name": "api-int.test-infra-cluster-mno2.redhat.com", "ip": "192.168.124.5"},
+            ],
+        }
+
+    def test_identity_rewrite_replaces_old_names_once(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        pairs = ct.compact_identity_pairs(self._source(), "aabbccdd", nodes)
+        text = "\n".join([
+            "match ^api-int.test-infra-cluster-mno.redhat.com",
+            "https://api-int.test-infra-cluster-mno2.redhat.com:6443/healthz",
+            "baseDomain: test-infra-cluster-mno.redhat.com",
+            "192.168.124.5",
+            "192.168.124.10",
+            "192.168.124.69",
+            "192.168.124.50",
+        ])
+        rewritten = ct.apply_identity(text, pairs)
+        self.assertNotIn("test-infra-cluster-mno.redhat.com", rewritten)
+        self.assertNotIn("test-infra-cluster-mno2.redhat.com", rewritten)
+        self.assertIn("api-int.test-infra-cluster-aabbccdd.redhat.com", rewritten)
+        self.assertIn("baseDomain: test-infra-cluster-aabbccdd.redhat.com", rewritten)
+        self.assertIn("192.168.200.5", rewritten)
+        self.assertIn("192.168.200.10", rewritten)
+        self.assertIn("192.168.200.69", rewritten)
+        self.assertIn("192.168.124.50", rewritten)
+
+    def test_recert_runs_once_on_the_first_master(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        commands = ct.recert_compact_commands(
+            self._source(), "aabbccdd", nodes, "/tmp/crypto", "ingress-operator", "/tmp/plan")
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["name"], "master-0-0")
+        self.assertEqual(commands[0]["argv"][commands[0]["argv"].index("--hostname") + 1], "master-0-0")
+        self.assertIn("--etcd-endpoint", commands[0]["argv"])
+        self.assertNotIn("--disk-only", commands[0]["argv"])
+        self.assertEqual(commands[0]["expected_error"], "Expected exactly one node")
+
+    def test_heal_restores_quorum_etcd_certs_and_signs_kubelets(self):
+        nodes = ct.compact_node_plan("aabbccdd", 200, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        heal = ct.compact_heal_plan(
+            self._source(), "aabbccdd", nodes, "/tmp/crypto", "ingress-operator",
+            "/tmp/plan", "/tmp/crypto/csr-signer")
+        copy = heal["etcd_cert_copy"]
+        self.assertEqual(copy["from_role"], "master-0-1")
+        self.assertEqual(copy["to_role"], "master-0-0")
+        self.assertEqual(copy["from_ip"], "192.168.200.81")
+        self.assertEqual(copy["to_ip"], "192.168.200.69")
+        self.assertIn("secrets/etcd-client/tls.crt", copy["paths"])
+        signed = {item["role"] for item in heal["kubelet_sign"]}
+        self.assertEqual(signed, set(ct.COMPACT_ROLES))
+        script = heal["kubelet_sign"][0]["script"]
+        self.assertIn("CN=system:node:master-0-0", script)
+        self.assertIn("IP:192.168.200.69", script)
+        self.assertIn("extendedKeyUsage=clientAuth", script)
+        self.assertIn("/tmp/crypto/csr-signer/tls.crt", script)
+        self.assertIn("/etc/kubernetes/static-pod-resources/coredns/Corefile.tmpl", heal["rewrite_files"])
+        self.assertIn("/etc/systemd/system/nodeip-configuration.service", heal["rewrite_files"])
+        self.assertEqual(heal["base_domain"], "test-infra-cluster-aabbccdd.redhat.com")
+        text = ct.format_compact_heal(heal)
+        self.assertIn("Recert runs once", text)
+        self.assertIn("Do not copy the Recert etcd CA the other way", text)
+        self.assertIn("infrastructure cluster", text)
+        self.assertNotIn("--disk-only", text)
+        self.assertNotIn("192.168.", text)
+        self.assertNotIn("--cn-san-replace", text)
+        spec, status = ct.compact_infrastructure_patches("aabbccdd", 200)
+        self.assertEqual(spec["spec"]["platformSpec"]["baremetal"]["apiServerInternalIPs"], ["192.168.200.5"])
+        self.assertEqual(status["status"]["apiServerInternalURI"], "https://api-int.test-infra-cluster-aabbccdd.redhat.com:6443")
+        self.assertEqual(status["status"]["platformStatus"]["baremetal"]["ingressIPs"], ["192.168.200.10"])
+        self.assertIn("rm -f /run/nodeip-configuration/remote-worker", ct.compact_release_keepalived_script())
+        self.assertIn(("openshift-etcd", "etcd-endpoints"), ct.HEAL_IDENTITY_CONFIGMAPS)
+        self.assertIn(("openshift-apiserver", "config"), ct.HEAL_IDENTITY_CONFIGMAPS)
+        self.assertIn(("openshift-oauth-apiserver", "apiserver"), ct.HEAL_ETCD_DEPLOYMENTS)
+        endpoints = json.dumps({"data": {"endpoints": '{"a":"https://192.168.124.69:2379"}'}})
+        rewritten = json.loads(ct.rewrite_configmap(endpoints, [("192.168.124.69", "192.168.200.69")]))
+        self.assertEqual(rewritten["data"]["endpoints"], '{"a":"https://192.168.200.69:2379"}')
+        deployment = json.dumps({
+            "metadata": {"name": "apiserver"},
+            "spec": {"template": {"spec": {"containers": [{"args": ["https://192.168.124.81:2379"]}]}}},
+            "status": {"readyReplicas": 0},
+        })
+        updated = json.loads(ct.rewrite_deployment(deployment, [("192.168.124.81", "192.168.200.81")]))
+        self.assertEqual(updated["spec"]["template"]["spec"]["containers"][0]["args"], ["https://192.168.200.81:2379"])
+        self.assertNotIn("status", updated)
+        self.assertIn("kube-apiserver-cert-regeneration-controller", ct.compact_restart_cert_controller_command())
+        self.assertTrue(ct.presented_san_matches(
+            "DNS:api-int.test-infra-cluster-aabbccdd.redhat.com, IP Address:192.168.200.5",
+            "api-int.test-infra-cluster-aabbccdd.redhat.com"))
+        self.assertFalse(ct.presented_san_matches(
+            "DNS:kubernetes, DNS:kubernetes.default, IP Address:172.30.0.1",
+            "api-int.test-infra-cluster-aabbccdd.redhat.com"))
+
+    def test_clone_copy_keeps_source_disks_and_reissues_etcd_certs(self):
+        source_nodes = [
+            {"role": role, "disks": [{"path": f"/var/lib/libvirt/images/mno-test2/{role}.qcow2"}]}
+            for role in ct.COMPACT_ROLES
+        ]
+        disks = ct.compact_clone_disks("ctcmp03", source_nodes)
+        commands = ct.compact_copy_commands(disks)
+        self.assertIn("cp --reflink=always", commands[1])
+        self.assertIn("/var/lib/libvirt/images/mno-test2/master-0-0.qcow2", commands[1])
+        self.assertIn("/var/lib/libvirt/images/ctcmp03/master-0-0.qcow2", commands[1])
+        nodes = ct.compact_node_plan("ctcmp03", 253, ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        script = ct.compact_etcd_reissue_script(nodes, "/work/crypto", "/work/etcd-new")
+        self.assertIn("san_for 192.168.253.69", script)
+        self.assertIn("/work/crypto/etcd-signer.crt", script)
+        self.assertIn("/work/crypto/etcd-metric-signer.key", script)
+        self.assertNotIn("--force-new-cluster", script)
+        proxy = ct.compact_proxy_command("etcd-image", ["192.168.253.81", "192.168.253.89"])
+        self.assertIn("--advertise-client-url 127.0.0.1:2379", proxy)
+        self.assertNotIn("192.168.253.69", proxy)
+        body = base64.b64encode(b"api.test-infra-cluster-mno2.redhat.com").decode()
+        pairs = [("test-infra-cluster-mno2.redhat.com", "test-infra-cluster-ctcmp03.redhat.com")]
+        unit = "ExecStart=node-ip set 192.168.124.5\n"
+        raw = json.dumps({"spec": {"config": {
+            "storage": {"files": [
+                {"contents": {"source": f"data:text/plain;charset=utf-8;base64,{body}"}}
+            ]},
+            "systemd": {"units": [{"name": "nodeip-configuration.service", "contents": unit}]},
+        }}})
+        ip_pairs = pairs + [("192.168.124.5", "192.168.253.5")]
+        rewritten = json.loads(ct.rewrite_machineconfig(raw, ip_pairs))
+        encoded = rewritten["spec"]["config"]["storage"]["files"][0]["contents"]["source"].split(",", 1)[1]
+        self.assertIn(b"test-infra-cluster-ctcmp03.redhat.com", base64.b64decode(encoded))
+        self.assertIn("192.168.253.5", rewritten["spec"]["config"]["systemd"]["units"][0]["contents"])
+        pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\nserver: api.test-infra-cluster-mno2.redhat.com\n"
+        kept = ct.apply_identity_preserving_pems(pem, pairs)
+        self.assertIn("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----", kept)
+        self.assertIn("test-infra-cluster-ctcmp03.redhat.com", kept)
+
+    def test_compact_health_requires_three_nodes_and_operators(self):
+        nodes = ct.parse_oc_nodes(
+            "master-0-0   Ready   control-plane\n"
+            "master-0-1   Ready   control-plane\n"
+            "master-0-2   Ready,SchedulingDisabled   control-plane\n")
+        etcd = [
+            {"started": True, "leader": False},
+            {"started": True, "leader": True},
+            {"started": True, "leader": False},
+        ]
+        good = [{"name": "authentication", "available": "True", "progressing": "False", "degraded": "False"}]
+        self.assertFalse(ct.compact_health(nodes, etcd, good)["ok"])
+        nodes[2]["ready"] = True
+        bad = good + [{"name": "machine-config", "available": "True", "progressing": "False", "degraded": "True"}]
+        health = ct.compact_health(nodes, etcd, bad)
+        self.assertFalse(health["ok"])
+        self.assertEqual(health["unhealthy_operators"], ["machine-config"])
+        self.assertTrue(ct.compact_health(nodes, etcd, good)["ok"])
+
+    def test_compact_boot_refuses_before_the_sno_path(self):
+        class _State:
+            def __enter__(self):
+                return {"flavors": {"compact": {"topology": "compact"}}, "clones": {}}
+            def __exit__(self, *args):
+                return False
+        args = argparse.Namespace(flavor="compact", name=None, vcpus=None, memory_kib=None, pull_secret="/tmp/ps.json", no_rollback=False)
+        with patch.object(ct, "locked_state", _State):
+            with self.assertRaises(SystemExit) as ctx:
+                ct.cmd_boot(args)
+        self.assertIn("compact-boot", str(ctx.exception))
+
+    def test_flavor_layout_replaces_source_domain_and_ips(self):
+        flavor = {
+            "source_cluster": "mno-test2",
+            "source_primary_subnet": 124,
+            "memory_kib": 33554432,
+            "vcpus": 16,
+            "etcd_image": "quay.io/example/etcd:tag",
+        }
+        macs = ["52:54:00:a2:b0:aa", "52:54:00:76:07:c5", "52:54:00:ba:f0:e8"]
+        paths = [f"/flavors/mno-3node/disk-{i}.qcow2" for i in range(3)]
+        text = "KUBERNETES_SERVICE_HOST='api-int.test-infra-cluster-mno2.redhat.com'\n"
+        bases = ct.compact_dns_bases_from_text(text)
+        source = ct.compact_source_from_layout(flavor, macs, bases, paths)
+        nodes = ct.compact_node_plan("edge1", 200, macs)
+        pairs = dict(ct.compact_identity_pairs(source, "edge1", nodes))
+        self.assertEqual(pairs["192.168.124.69"], "192.168.200.69")
+        self.assertEqual(pairs["192.168.124.5"], "192.168.200.5")
+        self.assertEqual(
+            pairs["api-int.test-infra-cluster-mno2.redhat.com"],
+            "api-int.test-infra-cluster-edge1.redhat.com")
+        self.assertEqual(source["nodes"][0]["mac"], "52:54:00:a2:b0:aa")
+        self.assertEqual(source["nodes"][0]["disks"][0]["path"], paths[0])
+
+    def test_nm_mac_and_etcd_secret_pem_extraction(self):
+        self.assertEqual(ct.parse_nm_mac("mac-address=52:54:00:76:07:C5\n"), "52:54:00:76:07:c5")
+        fixture_key = _fixture_pem("PRIVATE KEY", "NOT-A-KEY")
+        fixture_cert = _fixture_pem("CERTIFICATE", "NOT-A-CERT")
+        other_key = _fixture_pem("PRIVATE KEY", "OTHER")
+        blob = (
+            b"noise /kubernetes.io/secrets/openshift-etcd/etcd-signer "
+            + fixture_cert + b"\n" + fixture_key
+            + b" /kubernetes.io/secrets/openshift-etcd/other "
+            + other_key
+        )
+        found = ct.extract_k8s_secret_pems(blob, "etcd-signer")
+        self.assertEqual(found, [fixture_cert, fixture_key])
+        self.assertEqual(ct.extract_k8s_secret_pems(blob, "missing"), [])
+
+    def test_clone_id_is_a_dns_label(self):
+        self.assertEqual(ct._safe_clone_id("edge1"), "edge1")
+        for bad in ("Edge1", "edge1-", "-edge", "a" * 32, ""):
+            with self.assertRaises(SystemExit) as ctx:
+                ct._safe_clone_id(bad)
+            self.assertIn("lowercase", str(ctx.exception))
+
+    def test_compact_subnet_is_reserved_in_state(self):
+        state = {
+            "flavors": {"mno": {"source_primary_subnet": 124}},
+            "clones": {"edge1": {"subnet_primary": 200, "subnet_secondary": 200, "topology": "compact"}},
+        }
+        self.assertEqual(ct.require_compact_subnet(state, 201), 201)
+        for bad in (0, 255, 124, 200, True):
+            with self.assertRaises(SystemExit):
+                ct.require_compact_subnet(state, bad)
+
+    def test_record_compact_clone_reserves_subnet(self):
+        saved = {}
+
+        class _State:
+            def __enter__(self):
+                return saved.setdefault("state", {"flavors": {}, "clones": {}})
+            def __exit__(self, *args):
+                return False
+
+        with patch.object(ct, "locked_state", _State):
+            ct.record_compact_clone("edge2", 201, "mno-3node")
+        info = saved["state"]["clones"]["edge2"]
+        self.assertEqual(info["topology"], "compact")
+        self.assertEqual(info["subnet_primary"], 201)
+        with patch.object(ct, "locked_state", _State):
+            with self.assertRaises(SystemExit):
+                ct.record_compact_clone("edge3", 201, "mno-3node")
+
+    def test_apiserver_etcd_trust_copy_uses_only_the_quorum_ca(self):
+        command = ct.compact_apiserver_etcd_trust_tar_command()
+        self.assertIn("etcd-serving-ca/ca-bundle.crt", command)
+        self.assertIn("etcd-client/tls.crt", command)
+        self.assertIn("etcd-client/tls.key", command)
+        self.assertNotIn("kubelet-serving-ca", command)
+        self.assertEqual(
+            ct.compact_new_rendered_master(
+                "rendered-master-f91e5e3bbeff38fff5ddf87f21226386",
+                "rendered-master-25faeae1e446640a1292f9d060699092"),
+            "rendered-master-25faeae1e446640a1292f9d060699092")
+        self.assertEqual(
+            ct.compact_new_rendered_master(
+                "rendered-master-f91e5e3bbeff38fff5ddf87f21226386",
+                "rendered-master-f91e5e3bbeff38fff5ddf87f21226386"),
+            "")
+        decoded = ct.rendered_machineconfig_files({
+            "spec": {"config": {"storage": {"files": [{
+                "path": "/etc/kubernetes/apiserver-url.env",
+                "contents": {"source": "data:,KUBERNETES_SERVICE_HOST%3Dapi-int.example.com%0A"},
+            }]}}}
+        })
+        self.assertEqual(
+            decoded["/etc/kubernetes/apiserver-url.env"],
+            "KUBERNETES_SERVICE_HOST=api-int.example.com\n")
+
+    def test_clone_log_includes_a_timestamp(self):
+        ct.env = MagicMock()
+        with patch("builtins.print") as printed:
+            ct._clone_log("/var/lib/libvirt/images/edge1", "copy the three flavor disks")
+        line = printed.call_args.args[0]
+        self.assertRegex(
+            line,
+            r"^===== \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} copy the three flavor disks =====$")
+        logged = ct.env.run.call_args.args[0]
+        self.assertIn(line, logged)
+
+    def test_inspect_summary_omits_addresses(self):
+        text = ct.format_compact_inspect({
+            "nodes": [{"role": "master-0-0", "ip": "192.168.124.69", "mac": "02:00:00:00:00:01"}],
+            "gateway": "192.168.124.1",
+        })
+        self.assertIn("master-0-0", text)
+        self.assertNotIn("192.168.", text)
+        self.assertNotIn("02:00", text)
+
+    def test_rhcos_deploy_ignores_origin_files(self):
+        names = ["abc.0.origin", "abc.0", "def.1"]
+        self.assertEqual(ct.choose_rhcos_deploy(names), "def.1")
 
 
 class TestFlavorState(unittest.TestCase):
@@ -2553,6 +3034,20 @@ class TestRunVmQuoting(unittest.TestCase):
             local_env.run_vm("192.168.1.10", "sudo python3 -c \"open('/etc/test')\"")
         self.assertIsInstance(captured["args"], list)
         self.assertEqual(captured["args"][-1], "sudo python3 -c \"open('/etc/test')\"")
+
+    def test_remote_run_vm_quotes_identity(self):
+        self.env.run_vm("192.168.1.10", "echo hello", identity="/tmp/key;touch /tmp/pwned")
+        self.assertNotIn("-i /tmp/key;touch", self.captured_cmd)
+        self.assertIn(shlex.quote("/tmp/key;touch /tmp/pwned"), self.captured_cmd)
+
+    def test_remote_write_expands_home(self):
+        with patch("subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stderr="")
+            self.env.write_file("~/.config/cluster-tool/state.json", "{}")
+        remote = run.call_args.args[0][-1]
+        self.assertIn('"$HOME"', remote)
+        self.assertIn("mkdir -p", remote)
+        self.assertNotIn("'~/", remote)
 
 
 class TestPullSecretInjection(unittest.TestCase):
