@@ -1427,6 +1427,19 @@ class TestCompactInspect(unittest.TestCase):
         text = ct.format_compact_heal(heal)
         self.assertIn("Recert runs once", text)
         self.assertIn("Do not copy the Recert etcd CA the other way", text)
+        self.assertIn("Do not copy Recert's keys the other way", text)
+        self.assertEqual(heal["client_trust_copy"]["from_role"], "master-0-1")
+        self.assertEqual(heal["client_trust_copy"]["to_role"], "master-0-0")
+        trust = ct.compact_apiserver_client_trust_tar_command()
+        self.assertIn("client-ca/ca-bundle.crt", trust)
+        self.assertIn("bound-service-account-signing-key/service-account.key", trust)
+        self.assertIn("sa-token-signing-certs/service-account-", trust)
+        self.assertNotIn("etcd-serving-ca", trust)
+        ready = [{"role": role, "ok": True} for role in ct.COMPACT_ROLES]
+        self.assertTrue(ct.compact_auth_ready(ready, ready))
+        rejected = [{"role": "master-0-0", "ok": False}] + ready[1:]
+        self.assertFalse(ct.compact_auth_ready(rejected, ready))
+        self.assertFalse(ct.compact_auth_ready(ready, rejected))
         self.assertIn("infrastructure cluster", text)
         self.assertNotIn("--disk-only", text)
         self.assertNotIn("192.168.", text)
@@ -1606,6 +1619,7 @@ class TestCompactInspect(unittest.TestCase):
         self.assertIn("etcd-client/tls.crt", command)
         self.assertIn("etcd-client/tls.key", command)
         self.assertNotIn("kubelet-serving-ca", command)
+        self.assertNotIn("client-ca/ca-bundle.crt", command)
         self.assertEqual(
             ct.compact_new_rendered_master(
                 "rendered-master-f91e5e3bbeff38fff5ddf87f21226386",

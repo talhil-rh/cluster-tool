@@ -898,6 +898,53 @@ def compact_apiserver_etcd_trust_tar_command():
     )
 
 
+CLIENT_TRUST_RELPATHS = (
+    "*/kube-apiserver-certs/configmaps/client-ca/ca-bundle.crt",
+    "*/kube-apiserver-certs/configmaps/aggregator-client-ca/ca-bundle.crt",
+    "*/kube-controller-manager-certs/configmaps/client-ca/ca-bundle.crt",
+    "*/kube-controller-manager-certs/configmaps/aggregator-client-ca/ca-bundle.crt",
+    "*/bound-service-account-signing-key/service-account.key",
+    "*/bound-service-account-signing-key/service-account.pub",
+    "*/kube-apiserver-pod-*/configmaps/bound-sa-token-signing-certs/service-account-*.pub",
+    "*/kube-apiserver-pod-*/configmaps/sa-token-signing-certs/service-account-*.pub",
+)
+
+
+def compact_apiserver_client_trust_tar_command():
+    """Tar the quorum client CA and service-account keys Recert replaced on one node."""
+    clauses = " -o ".join(f"-path {shlex.quote(path)}" for path in CLIENT_TRUST_RELPATHS)
+    return (
+        "sudo find /etc/kubernetes/static-pod-resources "
+        + clauses
+        + " | sudo tar -C / -T - -cf -"
+    )
+
+
+def compact_client_trust_digest_command():
+    """Hash the client CA and service-account public keys, without printing them."""
+    files = " ".join(shlex.quote(path) for path in (
+        "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/configmaps/client-ca/ca-bundle.crt",
+        "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/bound-service-account-signing-key/service-account.pub",
+    ))
+    return (
+        f"sudo sha256sum {files}; "
+        "sudo find /etc/kubernetes/static-pod-resources "
+        "-path '*/kube-apiserver-pod-*/configmaps/bound-sa-token-signing-certs/*.pub' "
+        "-o -path '*/kube-apiserver-pod-*/configmaps/sa-token-signing-certs/*.pub' "
+        "| sort | sudo xargs -r sha256sum"
+    )
+
+
+def compact_auth_ready(admin_auth, sa_auth):
+    """Return whether every master accepted both the admin certificate and a service-account token."""
+    needed = set(COMPACT_ROLES)
+
+    def accepted(results):
+        return {item.get("role") for item in results or [] if item.get("ok")}
+
+    return accepted(admin_auth) == needed and accepted(sa_auth) == needed
+
+
 def compact_new_rendered_master(previous, current):
     """Return a new rendered master MachineConfig name, or an empty string."""
     current = (current or "").strip()
@@ -1002,6 +1049,11 @@ def compact_heal_plan(source, clone_id, new_nodes, crypto_dir, ingress_cn, plan_
             "to_ip": by_role[RECERT_ROLE]["ip"],
             "paths": list(ETCD_CERT_RELPATHS),
         },
+        "client_trust_copy": {
+            "from_role": QUORUM_ETCD_ROLE,
+            "to_role": RECERT_ROLE,
+            "paths": list(CLIENT_TRUST_RELPATHS),
+        },
         "kubelet_sign": [
             {
                 "role": node["role"],
@@ -1032,17 +1084,26 @@ def format_compact_heal(heal):
         ),
     ]
     lines.append(f"   {len(copy['paths'])} certificate paths")
-    lines.append("3. Sign kubelet client and server certificates with the live CSR signer:")
+    trust = heal["client_trust_copy"]
+    lines.append(
+        f"3. Copy the quorum client CA and service-account signing keys from {trust['from_role']} "
+        f"to {trust['to_role']}, then restart that API server. "
+        "Do not copy Recert's keys the other way."
+    )
+    lines.append("4. Sign kubelet client and server certificates with the live CSR signer:")
     for item in heal["kubelet_sign"]:
         lines.append(f"   {item['role']}")
-    lines.append(f"4. Rewrite {len(heal['rewrite_files'])} files on every master.")
+    lines.append(f"5. Rewrite {len(heal['rewrite_files'])} files on every master.")
     lines.append(
-        f"5. Rewrite {len(heal['api_objects'])} API objects, plus infrastructure cluster "
+        f"6. Rewrite {len(heal['api_objects'])} API objects, plus infrastructure cluster "
         "spec and status, install-config, and the apiserver config."
     )
-    lines.append("6. Set DNS spec.baseDomain to the clone domain.")
-    lines.append("7. If chrony-wait blocks kubelet after a reboot: " + shlex.join(heal["chrony_wait_stop"]))
-    lines.append("8. Pass when three nodes are Ready, etcd has a leader, and every ClusterOperator is green.")
+    lines.append("7. Set DNS spec.baseDomain to the clone domain.")
+    lines.append("8. If chrony-wait blocks kubelet after a reboot: " + shlex.join(heal["chrony_wait_stop"]))
+    lines.append(
+        "9. Pass when three nodes are Ready, etcd has a leader, every ClusterOperator is green, "
+        "and every API server accepts the admin certificate and a service-account token."
+    )
     return "\n".join(lines)
 
 
@@ -1662,6 +1723,63 @@ def _oc(kubeconfig, server):
     )
 
 
+def _admin_auth_command(kubeconfig, ip):
+    """Build an oc whoami command aimed at one API server."""
+    return (
+        f"KUBECONFIG={shlex.quote(kubeconfig)} oc --insecure-skip-tls-verify "
+        f"--request-timeout=20s --server={shlex.quote('https://' + ip + ':6443')} whoami"
+    )
+
+
+def compact_admin_auth_results(kubeconfig, nodes):
+    """Ask every master to accept the admin client certificate."""
+    results = []
+    for node in nodes:
+        probe = env.run(_admin_auth_command(kubeconfig, node["ip"]), check=False)
+        results.append({
+            "role": node["role"],
+            "ok": probe.returncode == 0 and "system:" in (probe.stdout or ""),
+        })
+    return results
+
+
+def compact_serviceaccount_auth_results(oc, nodes, work):
+    """Ask every master to accept one short-lived service-account token."""
+    failed = [{"role": node["role"], "ok": False} for node in nodes]
+    minted = env.run(f"{oc} create token default --namespace default --duration=10m", check=False)
+    token = (minted.stdout or "").strip()
+    if minted.returncode != 0 or token.count(".") != 2 or any(char.isspace() for char in token):
+        return failed
+    path = f"{work}/.sa-probe-token"
+    env.write_file(path, token + "\n")
+    env.run(f"chmod 600 {shlex.quote(path)}")
+    results = []
+    try:
+        for node in nodes:
+            url = shlex.quote(f"https://{node['ip']}:6443/readyz")
+            probe = env.run(
+                "code=$(curl -sk -o /dev/null -w '%{http_code}' "
+                f"-H \"Authorization: Bearer $(cat {shlex.quote(path)})\" {url}); "
+                "printf '%s' \"$code\"",
+                check=False)
+            results.append({"role": node["role"], "ok": (probe.stdout or "").strip() == "200"})
+    finally:
+        env.run(f"rm -f {shlex.quote(path)}", check=False)
+    return results
+
+
+def _wait_admin_auth(kubeconfig, node, attempts=36):
+    """Wait until one API server accepts the admin client certificate."""
+    for _ in range(attempts):
+        probe = env.run(_admin_auth_command(kubeconfig, node["ip"]), check=False)
+        if probe.returncode == 0 and "system:" in (probe.stdout or ""):
+            return
+        time.sleep(5)
+    sys.exit(
+        f"{node['role']} still rejects the cluster client certificate. "
+        "The API address would keep returning credentials errors.")
+
+
 def compact_stash_historical_certs_script():
     """Build the script that moves historical etcd certificates aside."""
     return textwrap.dedent("""\
@@ -1748,6 +1866,30 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             "sudo tar -C / -xf /var/tmp/apiserver-etcd-trust.tar && "
             "sudo restorecon -R /etc/kubernetes/static-pod-resources || true",
             identity)
+        _clone_log(work, "restore quorum client CA and service-account keys onto master-0-0")
+        env.run(
+            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+            f"{shlex.quote(compact_apiserver_client_trust_tar_command())} "
+            f"> {shlex.quote(work + '/apiserver-client-trust.tar')}")
+        env.run(f"chmod 600 {shlex.quote(work + '/apiserver-client-trust.tar')}")
+        env.run(
+            "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+            f"{shlex.quote(work + '/apiserver-client-trust.tar')} "
+            f"core@{recert_node['ip']}:/var/tmp/apiserver-client-trust.tar")
+        _vm(recert_node["ip"],
+            "sudo tar -C / -xf /var/tmp/apiserver-client-trust.tar && "
+            "sudo restorecon -R /etc/kubernetes/static-pod-resources || true",
+            identity)
+        quorum_digest = _vm(quorum["ip"], compact_client_trust_digest_command(), identity, check=False)
+        recert_digest = _vm(recert_node["ip"], compact_client_trust_digest_command(), identity, check=False)
+        if (quorum_digest.returncode != 0 or recert_digest.returncode != 0
+                or quorum_digest.stdout != recert_digest.stdout):
+            sys.exit(
+                "master-0-0 client CA or service-account keys still differ from master-0-1. "
+                f"Log: {work}/clone.log")
+        _clone_log(work, "restart the Recert API server so it loads the quorum service-account keys")
+        _vm(recert_node["ip"], compact_reload_apiserver_script(), identity, check=False)
+        _wait_admin_auth(src_kc, recert_node)
 
         _clone_log(work, "sign kubelet certificates with the live CSR signer")
         clone_kc = f"{work}/clone.kubeconfig"
@@ -1899,6 +2041,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
     _clone_log(work, "wait for three Ready nodes, an etcd leader, and green operators")
     deadline = time.time() + 40 * 60
     last = None
+    last_auth = "unchecked"
     while time.time() < deadline:
         for node in nodes:
             _vm(node["ip"],
@@ -1930,11 +2073,26 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             })
         health = compact_health(parse_oc_nodes(nodes_out.stdout or ""), members, parse_oc_co(co_out.stdout or ""))
         last = health
-        _clone_log(work, f"health ready={health['ready']} etcd={health['etcd_started']} leader={health['leader']} unhealthy={','.join(health['unhealthy_operators']) or 'none'}")
-        if health["ok"] or (
+        admin_auth = compact_admin_auth_results(clone_kc, nodes)
+        admin_failed = [item["role"] for item in admin_auth if not item["ok"]]
+        operators_ready = health["ok"] or (
             health["ready"] == len(COMPACT_ROLES) and health["etcd_started"] == len(COMPACT_ROLES)
             and health["leader"] and health["unhealthy_operators"] == ["insights"]
-        ):
+        )
+        sa_failed = []
+        if operators_ready and not admin_failed:
+            sa_auth = compact_serviceaccount_auth_results(clone_oc, nodes, work)
+            sa_failed = [item["role"] for item in sa_auth if not item["ok"]]
+            auth_ready = compact_auth_ready(admin_auth, sa_auth)
+        else:
+            auth_ready = False
+        auth_detail = ",".join(admin_failed + [f"sa:{role}" for role in sa_failed]) or "ok"
+        last_auth = auth_detail
+        _clone_log(
+            work,
+            f"health ready={health['ready']} etcd={health['etcd_started']} leader={health['leader']} "
+            f"unhealthy={','.join(health['unhealthy_operators']) or 'none'} auth={auth_detail}")
+        if operators_ready and auth_ready:
             if health["unhealthy_operators"] == ["insights"]:
                 _clone_log(
                     work,
@@ -1944,7 +2102,9 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
                 _clone_log(work, f"Compact clone {clone_id} is healthy. Log: {work}/clone.log")
             return health
         time.sleep(30)
-    sys.exit(f"Clone did not become healthy within 40 minutes: {last}. Log: {work}/clone.log")
+    sys.exit(
+        f"Clone did not become healthy within 40 minutes: {last} auth={last_auth}. "
+        f"Log: {work}/clone.log")
 
 def _start_compact_clone(source, clone_id, subnet, nodes, macs, identity, work, crypto, etcd_image, ingress_cn, memory_kib, vcpus, skip_hash_check=False):
     """Define the compact guests, restore etcd, and start the heal."""

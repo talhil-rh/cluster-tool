@@ -65,3 +65,73 @@ We use `quay.io/osac-project/recert:latest` with two fixes over upstream:
 
 1. **Binary DER data handling** — upstream crashes on secrets with binary certificate data. The fork returns `None` for non-UTF-8 data instead of erroring.
 2. **PersistentVolume node affinity** — upstream doesn't update PV node affinity hostnames during `--hostname`. The fork adds PV support in etcd encoding and hostname replacement.
+
+## Compact clone follow-ups (edge1)
+
+Seen on `ocp-edge126` after `compact-boot` of flavor `mno-3node` as clone `edge1` (subnet 200, domain `test-infra-cluster-edge1.redhat.com`). Recert runs once, on `master-0-0`. The API address load-balances across `master-0-0` (`.69`), `master-0-1` (`.81`), and `master-0-2` (`.89`). These were fixed by hand on that cluster so OSAC could install. They still need to land in automation and in the flavor image.
+
+### API credentials — cluster-tool
+
+Recert rewrites trust files on `master-0-0` only. The other two masters keep the originals. About one request in three hits `master-0-0` and the API answers `the server has asked for the client to provide credentials`.
+
+Copy these from `master-0-1` onto `master-0-0`. Do not copy Recert's new material the other way.
+
+Client CA, so the admin kubeconfig (`system:admin`) is accepted:
+
+- `kube-apiserver-certs/configmaps/client-ca/ca-bundle.crt`
+- `kube-apiserver-certs/configmaps/aggregator-client-ca/ca-bundle.crt`
+- the same two bundles under `kube-controller-manager-certs/configmaps/`
+
+Service-account signing keys, so in-cluster tokens (Helm hooks, operator jobs) are accepted. The API server reads the public keys at start and does not reload them:
+
+- `kube-apiserver-certs/secrets/bound-service-account-signing-key/service-account.key`
+- `kube-apiserver-certs/secrets/bound-service-account-signing-key/service-account.pub`
+- `kube-apiserver-pod-*/configmaps/bound-sa-token-signing-certs/service-account-*.pub`
+- `kube-apiserver-pod-*/configmaps/sa-token-signing-certs/service-account-*.pub`
+
+Paths are under `/etc/kubernetes/static-pod-resources/`. After the copy, `restorecon` that tree and restart the kube-apiserver sandbox on `master-0-0` (`crictl stopp`). The client CA is picked up without a restart; the service-account keys are not.
+
+The health gate has to ask each node, not only the API address. `/version` and `/readyz` answer without credentials, so a VIP check can pass while Helm gets a 401. Before the run finishes, `oc whoami` with the admin kubeconfig must succeed against `https://<node>:6443` on all three, and one short-lived service-account token must get HTTP 200 from each node's `/readyz`.
+
+The compact heal in this tree copies those files, restarts that API server, and refuses to finish while any node rejects either check. That path has not been booted end to end, and it is not in the flavor image.
+
+### Ingress domain — cluster-tool
+
+DNS `spec.baseDomain` was rewritten to `test-infra-cluster-edge1.redhat.com`. `ingresses.config.openshift.io/cluster` `spec.domain` stayed `apps.test-infra-cluster-mno.redhat.com`. osac-installer reads the ingress domain and publishes Keycloak at `keycloak-keycloak.apps.test-infra-cluster-mno.redhat.com`. In-cluster clients use `keycloak.keycloak.svc.cluster.local`, so the install can proceed, but the route name is still the source cluster. Rewrite `spec.domain` to `apps.test-infra-cluster-<clone>.redhat.com` with the rest of the identity.
+
+### Keycloak storage — image or installer
+
+The booted cluster has no StorageClass. Each master disk is one OS disk (`vda`, xfs on `vda4`), so there is no volume group for LVMS.
+
+osac-installer `charts/osac-prereqs` creates PVC `keycloak/keycloak-database`: 2Gi, `ReadWriteOnce`, no `storageClassName`. The Keycloak wait hook (`oc wait deploy/keycloak-service -n keycloak`) then hits its deadline. The database pod stays Pending with `pod has unbound immediate PersistentVolumeClaims`, and the Keycloak pod sits in `Init:0/2`.
+
+Hand fix on edge1, tied to one node, not the image fix:
+
+- directory `/var/lib/keycloak-database` on `master-0-1`
+- PV `keycloak-database`, 2Gi, RWO, `storageClassName: ""`, hostPath of that directory, `nodeAffinity` `kubernetes.io/hostname=master-0-1`, reclaim `Retain`
+- with no default StorageClass, the chart's claim (also no class) bound to that PV
+
+The postgres container's fsGroup was `1000810000` (the namespace SCC range), not uid 26. `chown 26:26` and mode `770` still failed with `mkdir: cannot create directory '/var/lib/pgsql/data': Permission denied`. `chmod 777` and `chcon -t container_file_t` let the entrypoint create the data directory. The pod had to be deleted so it remounted the volume. After Postgres logged `accepting connections`, `keycloak-service` became Available.
+
+For the image, ship a default StorageClass (a spare disk plus LVMS), or stop requiring dynamic provisioning for the Keycloak database. A hostPath volume does not belong in the flavor.
+
+The OSAC chart's pre-install validation only warns when no default StorageClass exists. The operator subchart still runs a pre-install job, `osac-operator-label-sc`, when `controllers.storage` is true (the chart default; the edge1 values do not turn it off). That job exits 1 with `ERROR: No default StorageClass found` and Helm reports `BackoffLimitExceeded`. It then labels the default class `osac.openshift.io/tenant=Default` and `osac.openshift.io/storage-tier=default`.
+
+Hand fix on edge1: StorageClass `local-manual`, provisioner `kubernetes.io/no-provisioner`, `volumeBindingMode: WaitForFirstConsumer`, annotated `storageclass.kubernetes.io/is-default-class=true`. That lets the label job succeed. It does not create volumes. A PVC that omits `storageClassName` is now assigned `local-manual` by the default-class admission plugin and stays Pending until a PersistentVolume with that class exists. The image still needs a provisioner.
+
+Phase 3 then waits up to 40 minutes and ends with `context deadline exceeded` while these `osac` pods are not Ready:
+
+- `osac-aap-postgres-15-0` stays Pending. PVC `postgres-15-osac-aap-postgres-15-0` is 8Gi, `ReadWriteOnce`, class `local-manual`. Nothing creates a volume for that class.
+- `fulfillment-grpc-server` crash-loops with `invalid vault configuration: flag '--vault-endpoint' is required`. The chart command does not pass that flag. The values pin `ghcr.io/osac-project/fulfillment-service:latest`, which is ahead of this installer checkout. `osac-ui` then exits with `no healthy upstream`.
+- `osac-operator` crash-loops with `invalid fulfillment issuer URL`. Its deployment sets the fulfillment address and token file and does not set an issuer URL.
+- `bmf-operator` stays ContainerCreating because Secrets `osac-inventory-config` and `osac-management-config` are absent.
+
+### Fulfillment PostgreSQL — image or installer values
+
+`make install` phase 3 runs `check-postgres` before the OSAC chart. With `bundledPostgres.enabled` unset, that check requires Secret `fulfillment-db` and Secret `postgres-client-cert-service` in the `osac` namespace, plus a Service with ready endpoints. Those come from a PostgreSQL operator (CloudNativePG, Crunchy, or Zalando), and `base/osac-fulfillment-service/docs/INSTALL.md` says that path needs dynamic persistent volumes.
+
+This cluster has no StorageClass, so that operator path cannot create its volume. Set `bundledPostgres.enabled: true` in the values file. The chart then creates Postgres itself with `emptyDir` and skips the secret check. The pre-install hook only warns when no default StorageClass exists. The database contents disappear when that pod is rescheduled; a durable database still needs a StorageClass in the image.
+
+### Kubelet serving CA — cluster-tool, if log collection matters
+
+`oc logs` for pods on `master-0-1` failed TLS verification of the kubelet serving certificate. The signer was `kube-csr-signer_@1791570079`, which the client did not trust. Same shape as the API trust split: Recert rotated a CA on one node. The Keycloak install did not need this once the volume existed.

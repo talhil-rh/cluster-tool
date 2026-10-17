@@ -353,7 +353,7 @@ Each clone gets a fully unique identity through recert:
 
 ## Internals
 
-For deep technical details on how snapshot recloning works (OVN cleanup, etcd certificate hardlinks, standalone etcd, forked recert image), see [INTERNALS.md](INTERNALS.md).
+For deep technical details on how snapshot recloning works (OVN cleanup, etcd certificate hardlinks, standalone etcd, forked recert image) and the compact-clone follow-ups still needed in automation and the flavor image, see [INTERNALS.md](INTERNALS.md).
 
 ## Testing
 
