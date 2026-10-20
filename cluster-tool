@@ -903,6 +903,26 @@ CLIENT_TRUST_RELPATHS = (
     "*/kube-apiserver-certs/configmaps/aggregator-client-ca/ca-bundle.crt",
     "*/kube-controller-manager-certs/configmaps/client-ca/ca-bundle.crt",
     "*/kube-controller-manager-certs/configmaps/aggregator-client-ca/ca-bundle.crt",
+    "*/kube-apiserver-certs/secrets/aggregator-client/tls.crt",
+    "*/kube-apiserver-certs/secrets/aggregator-client/tls.key",
+    "*/kube-apiserver-certs/secrets/check-endpoints-client-cert-key/tls.crt",
+    "*/kube-apiserver-certs/secrets/check-endpoints-client-cert-key/tls.key",
+    "*/kube-apiserver-certs/secrets/control-plane-node-admin-client-cert-key/tls.crt",
+    "*/kube-apiserver-certs/secrets/control-plane-node-admin-client-cert-key/tls.key",
+    "*/kube-apiserver-certs/secrets/external-loadbalancer-serving-certkey/tls.crt",
+    "*/kube-apiserver-certs/secrets/external-loadbalancer-serving-certkey/tls.key",
+    "*/kube-apiserver-certs/secrets/internal-loadbalancer-serving-certkey/tls.crt",
+    "*/kube-apiserver-certs/secrets/internal-loadbalancer-serving-certkey/tls.key",
+    "*/kube-apiserver-certs/secrets/kubelet-client/tls.crt",
+    "*/kube-apiserver-certs/secrets/kubelet-client/tls.key",
+    "*/kube-apiserver-certs/secrets/localhost-serving-cert-certkey/tls.crt",
+    "*/kube-apiserver-certs/secrets/localhost-serving-cert-certkey/tls.key",
+    "*/kube-apiserver-certs/secrets/service-network-serving-certkey/tls.crt",
+    "*/kube-apiserver-certs/secrets/service-network-serving-certkey/tls.key",
+    "*/kube-controller-manager-certs/secrets/csr-signer/tls.crt",
+    "*/kube-controller-manager-certs/secrets/csr-signer/tls.key",
+    "*/kube-controller-manager-certs/secrets/kube-controller-manager-client-cert-key/tls.crt",
+    "*/kube-controller-manager-certs/secrets/kube-controller-manager-client-cert-key/tls.key",
     "*/bound-service-account-signing-key/service-account.key",
     "*/bound-service-account-signing-key/service-account.pub",
     "*/kube-apiserver-pod-*/configmaps/bound-sa-token-signing-certs/service-account-*.pub",
@@ -921,9 +941,14 @@ def compact_apiserver_client_trust_tar_command():
 
 
 def compact_client_trust_digest_command():
-    """Hash the client CA and service-account public keys, without printing them."""
+    """Hash the client CA, aggregator client, and service-account public keys, without printing them."""
     files = " ".join(shlex.quote(path) for path in (
         "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/configmaps/client-ca/ca-bundle.crt",
+        "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/configmaps/aggregator-client-ca/ca-bundle.crt",
+        "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/aggregator-client/tls.crt",
+        "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/kubelet-client/tls.crt",
+        "/etc/kubernetes/static-pod-resources/kube-controller-manager-certs/secrets/csr-signer/tls.crt",
+        "/etc/kubernetes/static-pod-resources/kube-controller-manager-certs/secrets/kube-controller-manager-client-cert-key/tls.crt",
         "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/bound-service-account-signing-key/service-account.pub",
     ))
     return (
@@ -1077,6 +1102,16 @@ def compact_apps_domain(clone_id):
     return f"apps.test-infra-cluster-{clone_id}.redhat.com"
 
 
+def compact_ingress_wildcard_host(clone_id):
+    """Default router certificate name for a compact clone."""
+    return "*." + compact_apps_domain(clone_id)
+
+
+def compact_ingresscontroller_status_patch(clone_id):
+    """Status domain the ingress operator uses when it mints the wildcard."""
+    return {"status": {"domain": compact_apps_domain(clone_id)}}
+
+
 def compact_identity_domain_patches(clone_id):
     """DNS baseDomain and ingress spec.domain for the clone, not the source."""
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
@@ -1164,6 +1199,85 @@ def compact_apply_clone_ingress_domain(oc, clone_id, work):
     return ok or compact_identity_domains(oc).get("apps_domain") == wanted
 
 
+def _router_cert_subject(oc):
+    """Read the default router certificate subject."""
+    raw = env.run(
+        f"{oc} get secret router-certs-default -n openshift-ingress "
+        "-o jsonpath='{.data.tls\\.crt}'",
+        check=False)
+    if raw.returncode != 0 or not (raw.stdout or "").strip():
+        return ""
+    subject = env.run(
+        "printf '%s' " + shlex.quote((raw.stdout or "").strip()) + " | base64 -d | openssl x509 -noout -subject",
+        check=False)
+    return (subject.stdout or "").strip()
+
+
+def _sync_ingress_wildcard(oc, clone_id, work):
+    """Point the default router at the clone apps domain and reissue its wildcard.
+
+    IngressController status.domain stays on the source name after spec.domain
+    changes, and the router keeps serving that source wildcard.
+    """
+    host = compact_ingress_wildcard_host(clone_id)
+    patch = compact_ingresscontroller_status_patch(clone_id)
+    env.run(
+        f"{oc} patch ingresscontroller default -n openshift-ingress-operator "
+        f"--subresource=status --type=merge -p {shlex.quote(json.dumps(patch))}",
+        check=False)
+    subject = _router_cert_subject(oc)
+    if host in subject:
+        return True
+    out = f"{work}/router-wildcard"
+    env.run(f"mkdir -p {shlex.quote(out)} && chmod 700 {shlex.quote(out)}")
+    extracted = env.run(
+        f"{oc} extract secret/router-ca -n openshift-ingress-operator "
+        f"--to={shlex.quote(out)} --confirm",
+        check=False)
+    if extracted.returncode != 0:
+        _clone_log(work, "router CA is not available yet")
+        return False
+    env.write_file(f"{out}/san.cnf", textwrap.dedent(f"""\
+        basicConstraints=CA:FALSE
+        keyUsage=digitalSignature,keyEncipherment
+        extendedKeyUsage=serverAuth
+        subjectAltName=DNS:{host}
+        """))
+    signed = env.run(textwrap.dedent(f"""\
+        set -euo pipefail
+        cd {shlex.quote(out)}
+        openssl req -new -newkey rsa:2048 -nodes -keyout leaf.key \\
+            -subj {shlex.quote('/CN=' + host)} -out leaf.csr >/dev/null 2>&1
+        openssl x509 -req -in leaf.csr -CA tls.crt -CAkey tls.key -CAcreateserial \\
+            -out leaf.crt -days 720 -extfile san.cnf >/dev/null 2>&1
+        cat leaf.crt tls.crt > full.crt
+        openssl verify -CAfile tls.crt leaf.crt >/dev/null
+        python3 - << 'PY'
+        import base64, json, os, pathlib
+        patch = {{"data": {{
+            "tls.crt": base64.b64encode(pathlib.Path("full.crt").read_bytes()).decode(),
+            "tls.key": base64.b64encode(pathlib.Path("leaf.key").read_bytes()).decode(),
+        }}}}
+        pathlib.Path("patch.json").write_text(json.dumps(patch))
+        os.chmod("patch.json", 0o600)
+        PY
+        """), check=False)
+    if signed.returncode != 0:
+        _clone_log(work, "could not sign the clone ingress wildcard")
+        env.run(f"rm -rf {shlex.quote(out)}", check=False)
+        return False
+    patched = env.run(
+        f"{oc} patch secret router-certs-default -n openshift-ingress --type=merge "
+        f"--patch-file {shlex.quote(out + '/patch.json')}",
+        check=False)
+    env.run(f"rm -rf {shlex.quote(out)}", check=False)
+    if patched.returncode != 0:
+        _clone_log(work, "could not install the clone ingress wildcard")
+        return False
+    _clone_log(work, "installed the clone ingress wildcard")
+    return host in _router_cert_subject(oc) or patched.returncode == 0
+
+
 def format_compact_heal(heal):
     """Describe the heal by role and step count, without addresses or Recert arguments."""
     recert = heal["recert_once"]
@@ -1179,9 +1293,9 @@ def format_compact_heal(heal):
     lines.append(f"   {len(copy['paths'])} certificate paths")
     trust = heal["client_trust_copy"]
     lines.append(
-        f"3. Copy the quorum client CA and service-account signing keys from {trust['from_role']} "
-        f"to {trust['to_role']}, then start kubelet on {trust['to_role']} "
-        "(Recert stopped it). Do not copy Recert's keys the other way."
+        f"3. Copy the quorum client CA, aggregator client certificate, and service-account "
+        f"signing keys from {trust['from_role']} to {trust['to_role']}, then start kubelet on "
+        f"{trust['to_role']} (Recert stopped it). Do not copy Recert's keys the other way."
     )
     lines.append("4. Sign kubelet client and server certificates with the live CSR signer:")
     for item in heal["kubelet_sign"]:
@@ -1910,6 +2024,74 @@ def _extract_secret(oc, namespace, name, key, dest):
     env.run(f"chmod 600 {shlex.quote(dest)}")
 
 
+def _sync_requestheader_aggregator_ca(kubeconfig, api_ip, work, identity, quorum_ip):
+    """Trust only the quorum aggregator CA for aggregated API calls.
+
+    Recert leaves a second aggregator CA with the same subject in
+    extension-apiserver-authentication. openshift-apiserver then rejects the
+    quorum aggregator client certificate.
+    """
+    remote = (
+        "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/"
+        "configmaps/aggregator-client-ca/ca-bundle.crt"
+    )
+    fetched = _vm(quorum_ip, f"sudo cat {remote}", identity, check=False)
+    pem = fetched.stdout or ""
+    if fetched.returncode != 0 or pem.count("BEGIN CERTIFICATE") != 1:
+        _clone_log(work, "quorum aggregator CA was not a single certificate")
+        return
+    if not pem.endswith("\n"):
+        pem += "\n"
+    ca_path = f"{work}/aggregator-client-ca.crt"
+    patch_path = f"{work}/requestheader-ca.patch.json"
+    env.write_file(ca_path, pem)
+    env.run(f"chmod 600 {shlex.quote(ca_path)}")
+    oc = _oc(kubeconfig, f"https://{api_ip}:6443")
+    _clone_log(work, "set aggregated API trust to the quorum aggregator CA")
+    for _ in range(6):
+        current = env.run(
+            f"{oc} get cm extension-apiserver-authentication -n kube-system -o json",
+            check=False)
+        if current.returncode != 0 or not (current.stdout or "").strip():
+            time.sleep(5)
+            continue
+        raw_path = f"{work}/extension-apiserver-authentication.json"
+        env.write_file(raw_path, current.stdout)
+        env.run(f"chmod 600 {shlex.quote(raw_path)}")
+        decision = env.run(
+            "python3 - " + shlex.quote(raw_path) + " " + shlex.quote(ca_path) + " " + shlex.quote(patch_path) + """ << 'PY'
+import json, os, pathlib, sys
+raw_path, ca_path, patch_path = sys.argv[1:]
+pem = pathlib.Path(ca_path).read_text()
+doc = json.loads(pathlib.Path(raw_path).read_text())
+have = ((doc.get("data") or {}).get("requestheader-client-ca-file") or "")
+if have.strip() == pem.strip() and have.count("BEGIN CERTIFICATE") == 1:
+    print("unchanged")
+    raise SystemExit(0)
+pathlib.Path(patch_path).write_text(json.dumps({"data": {"requestheader-client-ca-file": pem}}))
+os.chmod(patch_path, 0o600)
+print("update")
+PY""",
+            check=False)
+        env.run(f"rm -f {shlex.quote(raw_path)}", check=False)
+        status = (decision.stdout or "").strip().splitlines()
+        if decision.returncode == 0 and status and status[-1] == "unchanged":
+            env.run(f"rm -f {shlex.quote(ca_path)} {shlex.quote(patch_path)}", check=False)
+            return
+        if decision.returncode == 0 and status and status[-1] == "update":
+            patched = env.run(
+                f"{oc} patch cm extension-apiserver-authentication -n kube-system "
+                f"--type=merge --patch-file {shlex.quote(patch_path)}",
+                check=False)
+            env.run(f"rm -f {shlex.quote(patch_path)}", check=False)
+            if patched.returncode == 0:
+                env.run(f"rm -f {shlex.quote(ca_path)}", check=False)
+                return
+        time.sleep(5)
+    env.run(f"rm -f {shlex.quote(ca_path)} {shlex.quote(patch_path)}", check=False)
+    _clone_log(work, "aggregated API trust still has a second aggregator CA")
+
+
 def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn, plan_path, by_role, api_ip, src_kc, pairs, start_at=None):
     """Finish certificate heal, identity rewrite, and the compact health wait."""
     if start_at == "health":
@@ -1995,11 +2177,12 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         if (quorum_digest.returncode != 0 or recert_digest.returncode != 0
                 or quorum_digest.stdout != recert_digest.stdout):
             sys.exit(
-                "master-0-0 client CA or service-account keys still differ from master-0-1. "
+                "master-0-0 client CA, aggregator client, or service-account keys still differ from master-0-1. "
                 f"Log: {work}/clone.log")
         _clone_log(work, "start kubelet on master-0-0 so it loads the quorum client CA")
         _vm(recert_node["ip"], compact_start_recert_node_script(), identity, check=False)
         _wait_admin_auth(src_kc, recert_node)
+        _sync_requestheader_aggregator_ca(src_kc, api_ip, work, identity, quorum["ip"])
 
         _clone_log(work, "sign kubelet certificates with the live CSR signer")
         clone_kc = f"{work}/clone.kubeconfig"
@@ -2144,6 +2327,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             check=False)
         _clone_log(work, "set ingress spec.domain to the clone apps domain")
         compact_apply_clone_ingress_domain(clone_oc, clone_id, work)
+        _sync_ingress_wildcard(clone_oc, clone_id, work)
         _ensure_api_certificates(clone_oc, work, domain, api_vip, nodes, identity)
         for node in nodes:
             _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true; sudo systemctl restart crio", identity, check=False)
@@ -2208,6 +2392,8 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             compact_apply_clone_ingress_domain(clone_oc, clone_id, work)
             domains = compact_identity_domains(clone_oc)
             domains_ready = compact_identity_domains_ready(domains, clone_id)
+        if "console" in health["unhealthy_operators"] or "ingress" in health["unhealthy_operators"]:
+            _sync_ingress_wildcard(clone_oc, clone_id, work)
         domain_detail = (
             f"dns={domains['base_domain'] or 'missing'} "
             f"ingress={domains['apps_domain'] or 'missing'}"

@@ -1458,13 +1458,25 @@ class TestCompactInspect(unittest.TestCase):
         self.assertNotIn("stop kubelet", start)
         self.assertIn("ingress spec.domain", text)
         self.assertIn("apps.test-infra-cluster-aabbccdd.redhat.com", text)
+        self.assertEqual(
+            ct.compact_ingress_wildcard_host("aabbccdd"),
+            "*.apps.test-infra-cluster-aabbccdd.redhat.com")
+        self.assertEqual(
+            ct.compact_ingresscontroller_status_patch("aabbccdd")["status"]["domain"],
+            "apps.test-infra-cluster-aabbccdd.redhat.com")
         self.assertEqual(heal["client_trust_copy"]["from_role"], "master-0-1")
         self.assertEqual(heal["client_trust_copy"]["to_role"], "master-0-0")
         trust = ct.compact_apiserver_client_trust_tar_command()
         self.assertIn("client-ca/ca-bundle.crt", trust)
+        self.assertIn("aggregator-client/tls.crt", trust)
+        self.assertIn("kubelet-client/tls.crt", trust)
+        self.assertIn("csr-signer/tls.crt", trust)
         self.assertIn("bound-service-account-signing-key/service-account.key", trust)
         self.assertIn("sa-token-signing-certs/service-account-", trust)
         self.assertNotIn("etcd-serving-ca", trust)
+        digest = ct.compact_client_trust_digest_command()
+        self.assertIn("aggregator-client/tls.crt", digest)
+        self.assertIn("aggregator-client-ca/ca-bundle.crt", digest)
         ready = [{"role": role, "ok": True} for role in ct.COMPACT_ROLES]
         self.assertTrue(ct.compact_auth_ready(ready, ready))
         rejected = [{"role": "master-0-0", "ok": False}] + ready[1:]
