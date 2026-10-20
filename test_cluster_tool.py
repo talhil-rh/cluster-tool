@@ -1434,6 +1434,19 @@ class TestCompactInspect(unittest.TestCase):
         self.assertFalse(ct.compact_identity_domains_ready(
             {"base_domain": heal["base_domain"], "apps_domain": "apps.test-infra-cluster-mno.redhat.com"},
             "aabbccdd"))
+        crd = json.dumps({
+            "spec": {"versions": [{"schema": {"openAPIV3Schema": {"properties": {
+                "spec": {"properties": {"domain": {
+                    "type": "string",
+                    "x-kubernetes-validations": [
+                        {"message": "domain is immutable once set", "rule": "self == oldSelf"},
+                    ],
+                }}}
+            }}}}]},
+        })
+        stripped = json.loads(ct.compact_strip_ingress_domain_lock(crd))
+        domain = stripped["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["domain"]
+        self.assertNotIn("x-kubernetes-validations", domain)
         text = ct.format_compact_heal(heal)
         self.assertIn("Recert runs once", text)
         self.assertIn("Do not copy the Recert etcd CA the other way", text)

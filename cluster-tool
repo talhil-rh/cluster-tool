@@ -1108,6 +1108,62 @@ def compact_identity_domains_ready(observed, clone_id):
     )
 
 
+def _ingress_domain_schema(doc):
+    """Yield the Ingress spec.domain OpenAPI nodes from a CRD document."""
+    for version in doc.get("spec", {}).get("versions") or []:
+        domain = (
+            ((version.get("schema") or {}).get("openAPIV3Schema") or {})
+            .get("properties", {})
+            .get("spec", {})
+            .get("properties", {})
+            .get("domain")
+        )
+        if isinstance(domain, dict):
+            yield domain
+
+
+def compact_strip_ingress_domain_lock(raw):
+    """Remove the CEL rule that makes ingress spec.domain immutable."""
+    doc = json.loads(raw)
+    for domain in _ingress_domain_schema(doc):
+        domain.pop("x-kubernetes-validations", None)
+    return json.dumps(doc)
+
+
+def compact_apply_clone_ingress_domain(oc, clone_id, work):
+    """Set ingress spec.domain to the clone apps domain.
+
+    OpenShift rejects oc patch because spec.domain is immutable on the CRD.
+    Lift that CEL rule, patch the object, then put the original CRD back.
+    """
+    wanted = compact_apps_domain(clone_id)
+    if compact_identity_domains(oc).get("apps_domain") == wanted:
+        return True
+    crd = env.run(
+        f"{oc} get crd ingresses.config.openshift.io -o json",
+        check=False)
+    if crd.returncode != 0 or not (crd.stdout or "").strip():
+        return False
+    unlocked = f"{work}/ingresses.config.crd.unlocked.json"
+    original = f"{work}/ingresses.config.crd.original.json"
+    env.write_file(original, crd.stdout)
+    env.write_file(unlocked, compact_strip_ingress_domain_lock(crd.stdout))
+    body = compact_identity_domain_patches(clone_id)["ingress"]
+    ok = False
+    for _ in range(5):
+        env.run(f"{oc} replace -f {shlex.quote(unlocked)}", check=False)
+        patched = env.run(
+            f"{oc} patch ingresses.config.openshift.io cluster --type=merge "
+            f"-p {shlex.quote(json.dumps(body))}",
+            check=False)
+        if patched.returncode == 0:
+            ok = True
+            break
+        time.sleep(2)
+    env.run(f"{oc} replace -f {shlex.quote(original)}", check=False)
+    return ok or compact_identity_domains(oc).get("apps_domain") == wanted
+
+
 def format_compact_heal(heal):
     """Describe the heal by role and step count, without addresses or Recert arguments."""
     recert = heal["recert_once"]
@@ -2086,10 +2142,8 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             f"{clone_oc} patch dns.config.openshift.io cluster --type=merge "
             f"-p {shlex.quote(json.dumps(identity_domains['dns']))}",
             check=False)
-        env.run(
-            f"{clone_oc} patch ingresses.config.openshift.io cluster --type=merge "
-            f"-p {shlex.quote(json.dumps(identity_domains['ingress']))}",
-            check=False)
+        _clone_log(work, "set ingress spec.domain to the clone apps domain")
+        compact_apply_clone_ingress_domain(clone_oc, clone_id, work)
         _ensure_api_certificates(clone_oc, work, domain, api_vip, nodes, identity)
         for node in nodes:
             _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true; sudo systemctl restart crio", identity, check=False)
@@ -2150,6 +2204,10 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         last_auth = auth_detail
         domains = compact_identity_domains(clone_oc)
         domains_ready = compact_identity_domains_ready(domains, clone_id)
+        if not domains_ready:
+            compact_apply_clone_ingress_domain(clone_oc, clone_id, work)
+            domains = compact_identity_domains(clone_oc)
+            domains_ready = compact_identity_domains_ready(domains, clone_id)
         domain_detail = (
             f"dns={domains['base_domain'] or 'missing'} "
             f"ingress={domains['apps_domain'] or 'missing'}"
