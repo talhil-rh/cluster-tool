@@ -1067,8 +1067,45 @@ def compact_heal_plan(source, clone_id, new_nodes, crypto_dir, ingress_cn, plan_
         "api_objects": [list(item) for item in HEAL_API_OBJECTS],
         "replacements": compact_identity_pairs(source, clone_id, new_nodes),
         "base_domain": f"test-infra-cluster-{clone_id}.redhat.com",
+        "ingress_domain": compact_apps_domain(clone_id),
         "chrony_wait_stop": list(CHRONY_WAIT_STOP),
     }
+
+
+def compact_apps_domain(clone_id):
+    """Ingress spec.domain for a compact clone."""
+    return f"apps.test-infra-cluster-{clone_id}.redhat.com"
+
+
+def compact_identity_domain_patches(clone_id):
+    """DNS baseDomain and ingress spec.domain for the clone, not the source."""
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    return {
+        "dns": {"spec": {"baseDomain": domain}},
+        "ingress": {"spec": {"domain": compact_apps_domain(clone_id)}},
+    }
+
+
+def compact_identity_domains(oc):
+    """Read DNS baseDomain and ingress spec.domain from the clone API."""
+    dns = env.run(
+        f"{oc} get dns.config.openshift.io cluster -o jsonpath='{{.spec.baseDomain}}'",
+        check=False)
+    ingress = env.run(
+        f"{oc} get ingresses.config.openshift.io cluster -o jsonpath='{{.spec.domain}}'",
+        check=False)
+    return {
+        "base_domain": (dns.stdout or "").strip(),
+        "apps_domain": (ingress.stdout or "").strip(),
+    }
+
+
+def compact_identity_domains_ready(observed, clone_id):
+    """True when DNS and ingress names match the clone."""
+    return (
+        observed.get("base_domain") == f"test-infra-cluster-{clone_id}.redhat.com"
+        and observed.get("apps_domain") == compact_apps_domain(clone_id)
+    )
 
 
 def format_compact_heal(heal):
@@ -1098,11 +1135,15 @@ def format_compact_heal(heal):
         f"6. Rewrite {len(heal['api_objects'])} API objects, plus infrastructure cluster "
         "spec and status, install-config, and the apiserver config."
     )
-    lines.append("7. Set DNS spec.baseDomain to the clone domain.")
+    lines.append(
+        "7. Set DNS spec.baseDomain and ingress spec.domain to the clone "
+        f"({heal['base_domain']}, {heal['ingress_domain']})."
+    )
     lines.append("8. If chrony-wait blocks kubelet after a reboot: " + shlex.join(heal["chrony_wait_stop"]))
     lines.append(
         "9. Pass when three nodes are Ready, etcd has a leader, every ClusterOperator is green, "
-        "and every API server accepts the admin certificate and a service-account token."
+        "every API server accepts the admin certificate and a service-account token, "
+        "and ingress spec.domain is the clone apps domain."
     )
     return "\n".join(lines)
 
@@ -2027,9 +2068,14 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
                     "machineconfiguration.openshift.io/state=Done --overwrite",
                     check=False)
                 env.run(f"{clone_oc} adm uncordon {node_names}", check=False)
+        identity_domains = compact_identity_domain_patches(clone_id)
         env.run(
             f"{clone_oc} patch dns.config.openshift.io cluster --type=merge "
-            f"-p {shlex.quote(json.dumps({'spec': {'baseDomain': domain}}))}",
+            f"-p {shlex.quote(json.dumps(identity_domains['dns']))}",
+            check=False)
+        env.run(
+            f"{clone_oc} patch ingresses.config.openshift.io cluster --type=merge "
+            f"-p {shlex.quote(json.dumps(identity_domains['ingress']))}",
             check=False)
         _ensure_api_certificates(clone_oc, work, domain, api_vip, nodes, identity)
         for node in nodes:
@@ -2042,6 +2088,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
     deadline = time.time() + 40 * 60
     last = None
     last_auth = "unchecked"
+    last_domains = "unchecked"
     while time.time() < deadline:
         for node in nodes:
             _vm(node["ip"],
@@ -2088,11 +2135,19 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             auth_ready = False
         auth_detail = ",".join(admin_failed + [f"sa:{role}" for role in sa_failed]) or "ok"
         last_auth = auth_detail
+        domains = compact_identity_domains(clone_oc)
+        domains_ready = compact_identity_domains_ready(domains, clone_id)
+        domain_detail = (
+            f"dns={domains['base_domain'] or 'missing'} "
+            f"ingress={domains['apps_domain'] or 'missing'}"
+        )
+        last_domains = domain_detail
         _clone_log(
             work,
             f"health ready={health['ready']} etcd={health['etcd_started']} leader={health['leader']} "
-            f"unhealthy={','.join(health['unhealthy_operators']) or 'none'} auth={auth_detail}")
-        if operators_ready and auth_ready:
+            f"unhealthy={','.join(health['unhealthy_operators']) or 'none'} auth={auth_detail} "
+            f"{domain_detail}")
+        if operators_ready and auth_ready and domains_ready:
             if health["unhealthy_operators"] == ["insights"]:
                 _clone_log(
                     work,
@@ -2103,7 +2158,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             return health
         time.sleep(30)
     sys.exit(
-        f"Clone did not become healthy within 40 minutes: {last} auth={last_auth}. "
+        f"Clone did not become healthy within 40 minutes: {last} auth={last_auth} {last_domains}. "
         f"Log: {work}/clone.log")
 
 def _start_compact_clone(source, clone_id, subnet, nodes, macs, identity, work, crypto, etcd_image, ingress_cn, memory_kib, vcpus, skip_hash_check=False):

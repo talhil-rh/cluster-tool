@@ -1424,10 +1424,22 @@ class TestCompactInspect(unittest.TestCase):
         self.assertIn("/etc/kubernetes/static-pod-resources/coredns/Corefile.tmpl", heal["rewrite_files"])
         self.assertIn("/etc/systemd/system/nodeip-configuration.service", heal["rewrite_files"])
         self.assertEqual(heal["base_domain"], "test-infra-cluster-aabbccdd.redhat.com")
+        self.assertEqual(heal["ingress_domain"], "apps.test-infra-cluster-aabbccdd.redhat.com")
+        patches = ct.compact_identity_domain_patches("aabbccdd")
+        self.assertEqual(patches["dns"]["spec"]["baseDomain"], heal["base_domain"])
+        self.assertEqual(patches["ingress"]["spec"]["domain"], heal["ingress_domain"])
+        self.assertTrue(ct.compact_identity_domains_ready(
+            {"base_domain": heal["base_domain"], "apps_domain": heal["ingress_domain"]},
+            "aabbccdd"))
+        self.assertFalse(ct.compact_identity_domains_ready(
+            {"base_domain": heal["base_domain"], "apps_domain": "apps.test-infra-cluster-mno.redhat.com"},
+            "aabbccdd"))
         text = ct.format_compact_heal(heal)
         self.assertIn("Recert runs once", text)
         self.assertIn("Do not copy the Recert etcd CA the other way", text)
         self.assertIn("Do not copy Recert's keys the other way", text)
+        self.assertIn("ingress spec.domain", text)
+        self.assertIn("apps.test-infra-cluster-aabbccdd.redhat.com", text)
         self.assertEqual(heal["client_trust_copy"]["from_role"], "master-0-1")
         self.assertEqual(heal["client_trust_copy"]["to_role"], "master-0-0")
         trust = ct.compact_apiserver_client_trust_tar_command()
