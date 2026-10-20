@@ -1124,8 +1124,8 @@ def format_compact_heal(heal):
     trust = heal["client_trust_copy"]
     lines.append(
         f"3. Copy the quorum client CA and service-account signing keys from {trust['from_role']} "
-        f"to {trust['to_role']}, then restart that API server. "
-        "Do not copy Recert's keys the other way."
+        f"to {trust['to_role']}, then start kubelet on {trust['to_role']} "
+        "(Recert stopped it). Do not copy Recert's keys the other way."
     )
     lines.append("4. Sign kubelet client and server certificates with the live CSR signer:")
     for item in heal["kubelet_sign"]:
@@ -1499,6 +1499,16 @@ def compact_reload_apiserver_script():
         """)
 
 
+def compact_start_recert_node_script():
+    """Start kubelet on the Recert node after Recert stopped it."""
+    return textwrap.dedent("""\
+        set +e
+        sudo systemctl start crio
+        sudo systemctl start kubelet
+        exit 0
+        """)
+
+
 def compact_restart_cert_controller_command():
     # The cert controller reads the internal API name once, when its process
     # starts. A later crio restart does not replace that process, so it keeps
@@ -1811,14 +1821,17 @@ def compact_serviceaccount_auth_results(oc, nodes, work):
 
 def _wait_admin_auth(kubeconfig, node, attempts=36):
     """Wait until one API server accepts the admin client certificate."""
+    last = ""
     for _ in range(attempts):
         probe = env.run(_admin_auth_command(kubeconfig, node["ip"]), check=False)
         if probe.returncode == 0 and "system:" in (probe.stdout or ""):
             return
+        last = ((probe.stderr or "") + "\n" + (probe.stdout or "")).strip()
         time.sleep(5)
     sys.exit(
         f"{node['role']} still rejects the cluster client certificate. "
-        "The API address would keep returning credentials errors.")
+        "The API address would keep returning credentials errors. "
+        f"Last whoami: {last[:400]}")
 
 
 def compact_stash_historical_certs_script():
@@ -1928,8 +1941,8 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             sys.exit(
                 "master-0-0 client CA or service-account keys still differ from master-0-1. "
                 f"Log: {work}/clone.log")
-        _clone_log(work, "restart the Recert API server so it loads the quorum service-account keys")
-        _vm(recert_node["ip"], compact_reload_apiserver_script(), identity, check=False)
+        _clone_log(work, "start kubelet on master-0-0 so it loads the quorum client CA")
+        _vm(recert_node["ip"], compact_start_recert_node_script(), identity, check=False)
         _wait_admin_auth(src_kc, recert_node)
 
         _clone_log(work, "sign kubelet certificates with the live CSR signer")
