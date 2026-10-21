@@ -1639,6 +1639,21 @@ class TestCompactInspect(unittest.TestCase):
             "api-int.test-infra-cluster-edge1.redhat.com")
         self.assertEqual(source["nodes"][0]["mac"], "52:54:00:a2:b0:aa")
         self.assertEqual(source["nodes"][0]["disks"][0]["path"], paths[0])
+        manifest = (
+            '{"name":"NODE_master_0_0_IP","value":"192.168.123.64"},'
+            '{"name":"NODE_master_0_1_IP","value":"192.168.123.65"},'
+            '{"name":"NODE_master_0_2_IP","value":"192.168.123.50"}')
+        member_ips = ct.compact_etcd_member_ips(manifest)
+        self.assertEqual(member_ips, {
+            "master-0-0": "192.168.123.64",
+            "master-0-1": "192.168.123.65",
+            "master-0-2": "192.168.123.50",
+        })
+        assisted = ct.compact_source_from_layout(
+            flavor, macs, bases, paths, node_ips=member_ips)
+        self.assertEqual(assisted["nodes"][0]["ip"], "192.168.123.64")
+        self.assertEqual(assisted["nodes"][1]["ip"], "192.168.123.65")
+        self.assertEqual(assisted["nodes"][2]["ip"], "192.168.123.50")
         nested = ct.compact_source_from_layout(flavor, macs, bases, [
             [paths[0], paths[0] + "-spare"], paths[1], paths[2]])
         self.assertEqual(nested["nodes"][0]["disks"][1]["path"], paths[0] + "-spare")

@@ -1489,7 +1489,19 @@ def extract_k8s_secret_pems(data, secret_name):
         window, flags=re.S)
 
 
-def compact_source_from_layout(flavor, macs, dns_bases, disk_paths):
+def compact_etcd_member_ips(manifest):
+    """Read the three etcd member addresses from a static pod manifest."""
+    found = {}
+    for name, ip in re.findall(
+            r'"name"\s*:\s*"NODE_(master_0_[012])_IP"\s*,\s*"value"\s*:\s*"(\d+\.\d+\.\d+\.\d+)"',
+            manifest or ""):
+        found[name.replace("_", "-")] = ip
+    if set(found) != set(COMPACT_ROLES):
+        sys.exit("Could not read the three etcd member IPs from the flavor disk")
+    return found
+
+
+def compact_source_from_layout(flavor, macs, dns_bases, disk_paths, node_ips=None):
     """Build a compact source record from flavor metadata and disk paths."""
     if len(macs) != len(COMPACT_ROLES) or len(disk_paths) != len(COMPACT_ROLES):
         sys.exit("A compact flavor needs three masters and three MAC addresses")
@@ -1504,11 +1516,12 @@ def compact_source_from_layout(flavor, macs, dns_bases, disk_paths):
             paths = list(paths)
         if not paths:
             sys.exit(f"Source node {role} has no disks")
+        ip = (node_ips or {}).get(role) or f"192.168.{subnet}.{suffix}"
         nodes.append({
             "role": role,
             "hostname": role,
             "mac": mac.lower(),
-            "ip": f"192.168.{subnet}.{suffix}",
+            "ip": ip,
             "disks": [{"path": path} for path in paths],
         })
     dns = []
@@ -2670,7 +2683,7 @@ def _write_etcd_signers(snapshot, crypto):
     env.run(f"rm -f {shlex.quote(crypto + '/extract-etcd-signers.py')}")
 
 
-def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, memory_kib=None, vcpus=None):
+def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, memory_kib=None, vcpus=None, resume=None):
     """Deploy a compact cluster from a pulled flavor."""
     clone_id = _safe_clone_id(clone_id)
     if flavor.get("topology") != "compact":
@@ -2684,9 +2697,13 @@ def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, mem
         sys.exit(f"Refusing to boot onto source subnet {subnet}.")
     work = f"/var/lib/libvirt/images/{clone_id}"
     exists = env.run(f"test -e {shlex.quote(work)} && echo yes || true")
-    if "yes" in exists.stdout:
+    if resume == "recert":
+        if "yes" not in exists.stdout:
+            sys.exit(f"Nothing to resume at {work}.")
+    elif "yes" in exists.stdout:
         sys.exit(f"{work} already exists. Remove that clone before running this one.")
-    record_compact_clone(clone_id, subnet, flavor_name)
+    else:
+        record_compact_clone(clone_id, subnet, flavor_name)
     fdir = flavor_dir(flavor_name)
     node_disks = []
     for _, os_name, spare_name in groups:
@@ -2701,7 +2718,9 @@ def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, mem
     if not bases:
         sys.exit("Could not find the source cluster domain on the flavor disk")
     macs = [_guest_mac(path) for path in os_disks]
-    source = compact_source_from_layout(flavor, macs, bases, node_disks)
+    member_ips = compact_etcd_member_ips(
+        _guest_cat(os_disks[0], "/etc/kubernetes/manifests/etcd-pod.yaml"))
+    source = compact_source_from_layout(flavor, macs, bases, node_disks, node_ips=member_ips)
     env.run(f"mkdir -p {shlex.quote(work)} && chmod 755 {shlex.quote(work)}")
     _clone_log(work, f"read identity from flavor {flavor_name}")
     kubeconfig = _guest_cat(
@@ -2714,6 +2733,20 @@ def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, mem
         node["hostname"] = node["role"]
         node["disk"] = f"{work}/{node['role']}.qcow2"
     crypto = f"{work}/crypto"
+    if resume == "recert":
+        ingress_cn = env.run(f"cat {shlex.quote(crypto + '/ingress-cn.txt')}").stdout.strip()
+        if not ingress_cn:
+            sys.exit("Flavor crypto is missing ingress-cn.txt")
+        if not identity:
+            identity = f"{crypto}/cluster-tool.key"
+        env.run(f"test -s {shlex.quote(identity)}")
+        pairs = compact_identity_pairs(source, clone_id, nodes)
+        by_role = {node["role"]: node for node in nodes}
+        api_ip = by_role[QUORUM_ETCD_ROLE]["ip"]
+        _clone_log(work, "resume at Recert")
+        return _finish_compact_clone(
+            source, clone_id, nodes, identity, work, crypto, flavor["etcd_image"], ingress_cn,
+            "/out/summary.txt", by_role, api_ip, f"{work}/source.kubeconfig", pairs)
     flavor_crypto = flavor_crypto_dir(flavor_name)
     env.run(
         f"mkdir -p {shlex.quote(crypto)} && chmod 700 {shlex.quote(crypto)} && "
@@ -2757,7 +2790,7 @@ def cmd_compact_boot(args):
         sys.exit(f"Flavor '{args.flavor}' not found. Available: {', '.join(state['flavors'])}")
     run_compact_from_flavor(
         args.flavor, flavor, args.name, args.subnet, args.identity or "",
-        memory_kib=args.memory_kib, vcpus=args.vcpus)
+        memory_kib=args.memory_kib, vcpus=args.vcpus, resume=args.resume)
 
 
 def run_compact_clone(source, clone_id, subnet, identity, memory_kib=None, vcpus=None, resume=None):
@@ -4471,6 +4504,7 @@ def main():
     flavor_boot_p.add_argument("--identity", default="", help="SSH key for the core user. Defaults to the flavor cluster-tool key")
     flavor_boot_p.add_argument("--memory-kib", type=int, help="Override memory for each VM, in KiB")
     flavor_boot_p.add_argument("--vcpus", type=int, help="Override vCPU count for each VM")
+    flavor_boot_p.add_argument("--resume", choices=["recert"], help="Continue an existing clone at Recert")
 
     sub.add_parser("servers", help="List connected servers")
 
