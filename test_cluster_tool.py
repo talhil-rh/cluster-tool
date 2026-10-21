@@ -1311,6 +1311,15 @@ class TestCompactInspect(unittest.TestCase):
         self.assertIn("dev='vda'", xml)
         self.assertIn("test-infra-net-aabbccdd", xml)
         self.assertNotIn("secondary-network", xml)
+        spare = ct.gen_compact_vm_xml(
+            "aabbccdd", nodes[0], [
+                "/data/master-0-0.qcow2",
+                "/data/master-0-0-spare.qcow2",
+            ])
+        self.assertIn("dev='vda'", spare)
+        self.assertIn("dev='vdb'", spare)
+        self.assertIn("/data/master-0-0-spare.qcow2", spare)
+        self.assertEqual(spare.count("<interface "), 1)
 
     def test_etcd_restore_commands_share_one_snapshot(self):
         nodes = ct.compact_node_plan("aabbccdd", 200, [
@@ -1523,6 +1532,32 @@ class TestCompactInspect(unittest.TestCase):
         self.assertIn("cp --reflink=always", commands[1])
         self.assertIn("/var/lib/libvirt/images/mno-test2/master-0-0.qcow2", commands[1])
         self.assertIn("/var/lib/libvirt/images/ctcmp03/master-0-0.qcow2", commands[1])
+        spare_nodes = [
+            {"role": role, "disks": [
+                {"path": f"/flavors/bare/disk-{index}.qcow2"},
+                {"path": f"/flavors/bare/disk-{index}-spare.qcow2"},
+            ]}
+            for index, role in enumerate(ct.COMPACT_ROLES)
+        ]
+        spare_disks = ct.compact_clone_disks("edge3", spare_nodes)
+        self.assertEqual(
+            [(disk["source"], disk["dest"]) for disk in spare_disks[:2]],
+            [
+                ("/flavors/bare/disk-0.qcow2",
+                 "/var/lib/libvirt/images/edge3/master-0-0.qcow2"),
+                ("/flavors/bare/disk-0-spare.qcow2",
+                 "/var/lib/libvirt/images/edge3/master-0-0-spare.qcow2"),
+            ])
+        self.assertEqual(len(spare_disks), 6)
+        groups = ct.compact_flavor_node_disks([
+            "disk-2-spare.qcow2", "disk-0.qcow2", "disk-1-spare.qcow2",
+            "disk-2.qcow2", "disk-0-spare.qcow2", "disk-1.qcow2",
+        ])
+        self.assertEqual(groups[0], ("master-0-0", "disk-0.qcow2", "disk-0-spare.qcow2"))
+        self.assertEqual(groups[2][2], "disk-2-spare.qcow2")
+        self.assertEqual(
+            ct.compact_flavor_node_disks(["disk-0.qcow2", "disk-1.qcow2", "disk-2.qcow2"])[1],
+            ("master-0-1", "disk-1.qcow2", None))
         nodes = ct.compact_node_plan("ctcmp03", 253, ["02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
         script = ct.compact_etcd_reissue_script(nodes, "/work/crypto", "/work/etcd-new")
         self.assertIn("san_for 192.168.253.69", script)
@@ -1604,6 +1639,12 @@ class TestCompactInspect(unittest.TestCase):
             "api-int.test-infra-cluster-edge1.redhat.com")
         self.assertEqual(source["nodes"][0]["mac"], "52:54:00:a2:b0:aa")
         self.assertEqual(source["nodes"][0]["disks"][0]["path"], paths[0])
+        nested = ct.compact_source_from_layout(flavor, macs, bases, [
+            [paths[0], paths[0] + "-spare"], paths[1], paths[2]])
+        self.assertEqual(nested["nodes"][0]["disks"][1]["path"], paths[0] + "-spare")
+        self.assertEqual(len(nested["nodes"][1]["disks"]), 1)
+        with self.assertRaises(SystemExit):
+            ct.compact_flavor_node_disks(["disk-0.qcow2"] * 6)
 
     def test_nm_mac_and_etcd_secret_pem_extraction(self):
         self.assertEqual(ct.parse_nm_mac("mac-address=52:54:00:76:07:C5\n"), "52:54:00:76:07:c5")

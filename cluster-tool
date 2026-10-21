@@ -1394,15 +1394,53 @@ def compact_bridge_name(clone_id):
     return "br-" + hashlib.sha256(clone_id.encode()).hexdigest()[:8]
 
 
+def compact_role_disk_dest(clone_id, role, index):
+    """Return the clone path for one disk of a compact master."""
+    if index == 0:
+        suffix = ""
+    elif index == 1:
+        suffix = "-spare"
+    else:
+        suffix = f"-disk{index}"
+    return f"/var/lib/libvirt/images/{clone_id}/{role}{suffix}.qcow2"
+
+
+def compact_flavor_node_disks(disk_names):
+    """Pair flavor disk files with the three masters.
+
+    A three-disk flavor is one OS disk per master, in list order.
+    A six-disk flavor pairs disk-N.qcow2 with disk-N-spare.qcow2.
+    Returns (role, os name, spare name or None).
+    """
+    names = list(disk_names or [])
+    if len(names) == len(COMPACT_ROLES):
+        return [(role, name, None) for role, name in zip(COMPACT_ROLES, names)]
+    wanted = []
+    for index, role in enumerate(COMPACT_ROLES):
+        wanted.append((role, f"disk-{index}.qcow2", f"disk-{index}-spare.qcow2"))
+    expected = [name for _, os_name, spare_name in wanted for name in (os_name, spare_name)]
+    if sorted(names) != sorted(expected):
+        sys.exit(
+            "A compact flavor needs 3 disks, or these 6: " + ", ".join(expected))
+    return wanted
+
+
 def compact_clone_disks(clone_id, source_nodes):
     """Pair each source disk with its compact clone destination."""
     _safe_clone_id(clone_id)
     by_role = {_compact_node_name(node): node for node in source_nodes}
     disks = []
     for role in COMPACT_ROLES:
-        src = by_role[role]["disks"][0]["path"]
-        dest = f"/var/lib/libvirt/images/{clone_id}/{role}.qcow2"
-        disks.append({"role": role, "source": src, "dest": dest})
+        sources = by_role[role]["disks"]
+        if not sources:
+            sys.exit(f"Source node {role} has no disks")
+        for index, src in enumerate(sources):
+            path = src["path"] if isinstance(src, dict) else src
+            disks.append({
+                "role": role,
+                "source": path,
+                "dest": compact_role_disk_dest(clone_id, role, index),
+            })
     return disks
 
 
@@ -1454,18 +1492,24 @@ def extract_k8s_secret_pems(data, secret_name):
 def compact_source_from_layout(flavor, macs, dns_bases, disk_paths):
     """Build a compact source record from flavor metadata and disk paths."""
     if len(macs) != len(COMPACT_ROLES) or len(disk_paths) != len(COMPACT_ROLES):
-        sys.exit("A compact flavor needs three disks and three MAC addresses")
+        sys.exit("A compact flavor needs three masters and three MAC addresses")
     subnet = int(flavor["source_primary_subnet"])
     api = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
     ingress = f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}"
     nodes = []
-    for role, suffix, mac, path in zip(COMPACT_ROLES, COMPACT_NODE_SUFFIXES, macs, disk_paths):
+    for role, suffix, mac, paths in zip(COMPACT_ROLES, COMPACT_NODE_SUFFIXES, macs, disk_paths):
+        if isinstance(paths, str):
+            paths = [paths]
+        else:
+            paths = list(paths)
+        if not paths:
+            sys.exit(f"Source node {role} has no disks")
         nodes.append({
             "role": role,
             "hostname": role,
             "mac": mac.lower(),
             "ip": f"192.168.{subnet}.{suffix}",
-            "disks": [{"path": path}],
+            "disks": [{"path": path} for path in paths],
         })
     dns = []
     for base in dns_bases:
@@ -2425,8 +2469,17 @@ def _start_compact_clone(source, clone_id, subnet, nodes, macs, identity, work, 
     _clone_log(work, "define and start the clone network and VMs")
     plan = build_compact_boot_plan(
         source, clone_id, subnet, macs, f"{work}/snapshot.db", "/tmp/crypto", ingress_cn, plan_path)
+    source_counts = {
+        _compact_node_name(node): len(node.get("disks") or [])
+        for node in source["nodes"]
+    }
     for node in plan["nodes"]:
-        node["disk"] = f"{work}/{node['role']}.qcow2"
+        count = source_counts.get(node["role"]) or 1
+        node["disks"] = [
+            compact_role_disk_dest(clone_id, node["role"], index)
+            for index in range(count)
+        ]
+        node["disk"] = node["disks"][0]
         node["hostname"] = node["role"]
     emulator, machine_type = resolve_vm_platform()
     define_compact_libvirt(plan, emulator, machine_type, memory_kib, vcpus)
@@ -2622,8 +2675,7 @@ def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, mem
     clone_id = _safe_clone_id(clone_id)
     if flavor.get("topology") != "compact":
         sys.exit(f"Flavor '{flavor_name}' is not a compact flavor")
-    if len(flavor.get("disks") or []) != len(COMPACT_ROLES):
-        sys.exit(f"Flavor '{flavor_name}' needs {len(COMPACT_ROLES)} disks")
+    groups = compact_flavor_node_disks(flavor.get("disks") or [])
     for key in ("source_primary_subnet", "memory_kib", "vcpus", "etcd_image"):
         if flavor.get(key) in (None, ""):
             sys.exit(f"Flavor '{flavor_name}' is missing {key}")
@@ -2636,18 +2688,24 @@ def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, mem
         sys.exit(f"{work} already exists. Remove that clone before running this one.")
     record_compact_clone(clone_id, subnet, flavor_name)
     fdir = flavor_dir(flavor_name)
-    disk_paths = [f"{fdir}/{name}" for name in flavor["disks"]]
-    url_text = _guest_cat(disk_paths[0], "/etc/kubernetes/apiserver-url.env")
-    kubeconfig_text = _guest_cat(disk_paths[0], "/etc/kubernetes/kubeconfig")
+    node_disks = []
+    for _, os_name, spare_name in groups:
+        paths = [f"{fdir}/{os_name}"]
+        if spare_name:
+            paths.append(f"{fdir}/{spare_name}")
+        node_disks.append(paths)
+    os_disks = [paths[0] for paths in node_disks]
+    url_text = _guest_cat(os_disks[0], "/etc/kubernetes/apiserver-url.env")
+    kubeconfig_text = _guest_cat(os_disks[0], "/etc/kubernetes/kubeconfig")
     bases = compact_dns_bases_from_text(url_text + "\n" + kubeconfig_text)
     if not bases:
         sys.exit("Could not find the source cluster domain on the flavor disk")
-    macs = [_guest_mac(path) for path in disk_paths]
-    source = compact_source_from_layout(flavor, macs, bases, disk_paths)
+    macs = [_guest_mac(path) for path in os_disks]
+    source = compact_source_from_layout(flavor, macs, bases, node_disks)
     env.run(f"mkdir -p {shlex.quote(work)} && chmod 755 {shlex.quote(work)}")
     _clone_log(work, f"read identity from flavor {flavor_name}")
     kubeconfig = _guest_cat(
-        disk_paths[0],
+        os_disks[0],
         "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig")
     env.write_file(f"{work}/source.kubeconfig", kubeconfig)
     env.run(f"chmod 600 {shlex.quote(work + '/source.kubeconfig')}")
@@ -2670,17 +2728,18 @@ def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, mem
     _clone_log(work, "copy the etcd database out of the flavor disk")
     env.run(f"mkdir -p {shlex.quote(work + '/snapshot-src')}")
     copied = env.run(
-        f"guestfish --ro -a {shlex.quote(disk_paths[1])} -m {shlex.quote(RHCOS_ROOT_MOUNT)} "
+        f"guestfish --ro -a {shlex.quote(os_disks[1])} -m {shlex.quote(RHCOS_ROOT_MOUNT)} "
         f"copy-out {shlex.quote(RHCOS_ETCD_DB)} {shlex.quote(work + '/snapshot-src')}",
         check=False)
     if copied.returncode != 0:
-        sys.exit(f"Could not copy the etcd database from {disk_paths[1]}. {(copied.stderr or '').strip()}")
+        sys.exit(f"Could not copy the etcd database from {os_disks[1]}. {(copied.stderr or '').strip()}")
     env.run(
         f"mv {shlex.quote(work + '/snapshot-src/db')} {shlex.quote(work + '/snapshot.db')} && "
         f"rmdir {shlex.quote(work + '/snapshot-src')} && chmod 644 {shlex.quote(work + '/snapshot.db')}")
     _clone_log(work, "read etcd signer keys from the snapshot")
     _write_etcd_signers(f"{work}/snapshot.db", crypto)
-    _clone_log(work, "copy the three flavor disks")
+    disk_count = sum(len(paths) for paths in node_disks)
+    _clone_log(work, f"copy the {disk_count} flavor disks")
     for command in compact_copy_commands(compact_clone_disks(clone_id, source["nodes"])):
         env.run(command)
     memory_kib = memory_kib or flavor["memory_kib"]
@@ -2897,9 +2956,13 @@ def define_compact_libvirt(plan, emulator, machine_type, memory_kib, vcpus):
     env.write_file(net_path, plan["network_xml"])
     env.run(f"virsh net-define {shlex.quote(net_path)}")
     for node in plan["nodes"]:
-        disk = node.get("disk") or f"/var/lib/libvirt/images/{clone_id}-{node['role']}.qcow2"
+        disks = node.get("disks")
+        if isinstance(disks, str):
+            disks = [disks]
+        if not disks:
+            disks = [node.get("disk") or f"/var/lib/libvirt/images/{clone_id}-{node['role']}.qcow2"]
         xml = gen_compact_vm_xml(
-            clone_id, node, [disk],
+            clone_id, node, disks,
             memory_kib=memory_kib, vcpus=vcpus,
             machine_type=machine_type, emulator=emulator)
         path = f"/tmp/vm-{node['domain']}.xml"
@@ -2914,6 +2977,8 @@ def undefine_compact_libvirt(clone_id):
         env.run(f"virsh destroy {shlex.quote(domain)}", check=False)
         env.run(f"virsh undefine {shlex.quote(domain)}", check=False)
         env.run(f"rm -f {shlex.quote(f'/var/lib/libvirt/images/{clone_id}-{role}.qcow2')}", check=False)
+        env.run(f"rm -f {shlex.quote(compact_role_disk_dest(clone_id, role, 0))}", check=False)
+        env.run(f"rm -f {shlex.quote(compact_role_disk_dest(clone_id, role, 1))}", check=False)
     net = f"test-infra-net-{clone_id}"
     env.run(f"virsh net-destroy {shlex.quote(net)}", check=False)
     env.run(f"virsh net-undefine {shlex.quote(net)}", check=False)
