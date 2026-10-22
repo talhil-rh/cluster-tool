@@ -1587,6 +1587,40 @@ def compact_etcd_reissue_script(nodes, signer_dir, out_dir):
     return "\n".join(lines) + "\n"
 
 
+def compact_etcd_cert_names(nodes):
+    """Return the etcd certificate stems reissued for each compact node."""
+    names = []
+    for node in nodes:
+        for kind in ("peer", "serving", "serving-metrics"):
+            names.append(f"etcd-{kind}-{node['role']}")
+    return names
+
+
+def compact_etcd_secret_patch(secret_raw, pems):
+    """Replace PEM keys that already exist in an etcd secret."""
+    doc = json.loads(secret_raw)
+    current = doc.get("data") or {}
+    data = {}
+    for key, pem in pems.items():
+        if key in current and pem:
+            data[key] = base64.b64encode(pem.encode()).decode()
+    return json.dumps({"data": data})
+
+
+def compact_install_etcd_certs_script():
+    """Copy reissued etcd certificates over every on-disk copy, including pod revisions."""
+    return textwrap.dedent("""\
+        set -euo pipefail
+        sudo find /etc/kubernetes/static-pod-resources \\( -name 'etcd-peer-*' -o -name 'etcd-serving-*' \\) | while read -r existing; do
+          base=$(basename "$existing")
+          if [ -f "/var/tmp/$base" ]; then
+            sudo cp "/var/tmp/$base" "$existing"
+          fi
+        done
+        sudo restorecon -R /etc/kubernetes/static-pod-resources || true
+        """)
+
+
 def compact_proxy_command(etcd_image, peer_ips):
     """Build the etcd grpc-proxy command used during the single Recert run."""
     endpoints = ",".join(f"https://{ip}:2379" for ip in peer_ips)
@@ -2200,6 +2234,71 @@ PY""",
     _clone_log(work, "aggregated API trust still has a second aggregator CA")
 
 
+def _load_reissued_etcd_pems(work, nodes):
+    """Read the reissued etcd PEMs for the bundle secret keys."""
+    pems = {}
+    root = Path(work) / "etcd-new"
+    for name in compact_etcd_cert_names(nodes):
+        for ext in ("crt", "key"):
+            path = root / f"{name}.{ext}"
+            if path.is_file():
+                pems[f"{name}.{ext}"] = path.read_text()
+    return pems
+
+
+def _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes):
+    """Install reissued etcd certificates into the bundle secrets and, when asked, onto the nodes."""
+    pems = _load_reissued_etcd_pems(work, nodes)
+    if not pems:
+        return
+    listed = env.run(f"{clone_oc} get secret -n openshift-etcd -o name", check=False)
+    for line in (listed.stdout or "").splitlines():
+        name = line.strip().split("/")[-1]
+        if not name.startswith("etcd-all-certs"):
+            continue
+        raw = env.run(
+            f"{clone_oc} get secret {shlex.quote(name)} -n openshift-etcd -o json",
+            check=False)
+        if raw.returncode != 0 or not raw.stdout.strip():
+            continue
+        patch = compact_etcd_secret_patch(raw.stdout, pems)
+        if not json.loads(patch)["data"]:
+            continue
+        env.run(
+            f"{clone_oc} patch secret {shlex.quote(name)} -n openshift-etcd --type=merge "
+            f"-p {shlex.quote(patch)}",
+            check=False)
+    for node in nodes:
+        for kind in ("peer", "serving", "serving-metrics"):
+            secret = f"etcd-{kind}-{node['role']}"
+            raw = env.run(
+                f"{clone_oc} get secret {shlex.quote(secret)} -n openshift-etcd -o json",
+                check=False)
+            if raw.returncode != 0 or not raw.stdout.strip():
+                continue
+            member = {
+                "tls.crt": pems.get(f"{secret}.crt", ""),
+                "tls.key": pems.get(f"{secret}.key", ""),
+            }
+            patch = compact_etcd_secret_patch(raw.stdout, member)
+            if not json.loads(patch)["data"]:
+                continue
+            env.run(
+                f"{clone_oc} patch secret {shlex.quote(secret)} -n openshift-etcd --type=merge "
+                f"-p {shlex.quote(patch)}",
+                check=False)
+    if not copy_to_nodes:
+        return
+    for node in nodes:
+        for other in nodes:
+            env.run(
+                "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+                f"{shlex.quote(work + '/etcd-new')}/etcd-*-{other['role']}.crt "
+                f"{shlex.quote(work + '/etcd-new')}/etcd-*-{other['role']}.key "
+                f"core@{node['ip']}:/var/tmp/")
+        _vm(node["ip"], compact_install_etcd_certs_script(), identity, check=False)
+
+
 def _set_node_identity_webhook(clone_oc, policy):
     """Set the node-identity webhook failure policy."""
     env.run(
@@ -2381,6 +2480,8 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
     clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
     if start_at != "health":
+        _clone_log(work, "install reissued etcd certificates into the etcd bundle secrets")
+        _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes=False)
         _clone_log(work, "rewrite cluster records and 00-master")
         domain = f"test-infra-cluster-{clone_id}.redhat.com"
         for kind, namespace, name in HEAL_API_OBJECTS:
@@ -2508,6 +2609,8 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         env.run(
             f"{clone_oc} delete pod -n openshift-ovn-kubernetes -l app=ovnkube-node --force --grace-period=0",
             check=False)
+        _clone_log(work, "install reissued etcd certificates over the operator revision")
+        _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes=True)
 
     _clone_log(work, "wait for three Ready nodes, an etcd leader, and green operators")
     deadline = time.time() + 40 * 60
@@ -2703,17 +2806,7 @@ def _start_compact_clone(source, clone_id, subnet, nodes, macs, identity, work, 
                 f"{shlex.quote(work + '/etcd-new')}/etcd-*-{other['role']}.crt "
                 f"{shlex.quote(work + '/etcd-new')}/etcd-*-{other['role']}.key "
                 f"core@{node['ip']}:/var/tmp/")
-        _vm(node["ip"], textwrap.dedent("""\
-            set -euo pipefail
-            sudo find /etc/kubernetes/static-pod-resources -name 'etcd-peer-*' -o -name 'etcd-serving-*' | while read -r existing; do
-              base=$(basename "$existing")
-              if [ -f "/var/tmp/$base" ]; then
-                sudo cp "/var/tmp/$base" "$existing"
-              fi
-            done
-            sudo restorecon -R /etc/kubernetes/static-pod-resources || true
-            sudo systemctl start crio
-            """), identity)
+        _vm(node["ip"], compact_install_etcd_certs_script() + "sudo systemctl start crio\n", identity)
         _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
         _vm(node["ip"], "sudo systemctl start kubelet", identity)
 

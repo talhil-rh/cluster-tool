@@ -1640,6 +1640,22 @@ class TestCompactInspect(unittest.TestCase):
             {"role": "master-0-1", "ip": "192.168.204.81"},
             {"role": "master-0-2", "ip": "192.168.204.89"},
         ]))
+        secret = json.dumps({"data": {
+            "etcd-peer-master-0-2.crt": "b2xk",
+            "etcd-peer-master-0-2.key": "a2V5",
+            "untouched": "eWVz",
+        }})
+        patched = json.loads(ct.compact_etcd_secret_patch(secret, {
+            "etcd-peer-master-0-2.crt": "new-cert",
+            "missing.crt": "nope",
+        }))
+        self.assertEqual(base64.b64decode(patched["data"]["etcd-peer-master-0-2.crt"]).decode(), "new-cert")
+        self.assertNotIn("etcd-peer-master-0-2.key", patched["data"])
+        self.assertNotIn("missing.crt", patched["data"])
+        self.assertIn("etcd-peer-master-0-2", ct.compact_etcd_cert_names([
+            {"role": "master-0-2"},
+        ]))
+        self.assertIn("find /etc/kubernetes/static-pod-resources", ct.compact_install_etcd_certs_script())
         self.assertEqual(ct.parse_etcd_pods(
             "etcd-master-0-0 5/5 Running 0 1m\n"
             "etcd-master-0-1 0/5 Pending 0 1m\n"
