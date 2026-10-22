@@ -1620,6 +1620,11 @@ def compact_etcd_secret_delta(secret_raw, pems):
     return {"absent": absent, "changed": changed}
 
 
+def compact_etcd_force_redeploy_patch(reason):
+    """Ask the etcd operator to replace static pods one member at a time."""
+    return {"spec": {"forceRedeploymentReason": reason}}
+
+
 def compact_etcd_secret_patch(secret_raw, pems):
     """Replace PEM keys that already exist in an etcd secret and differ."""
     doc = json.loads(secret_raw)
@@ -2417,7 +2422,21 @@ def _require_reissued_etcd_certs(clone_oc, nodes, identity, work):
         sys.exit(
             f"etcd certificate inputs {status}{detail}. "
             f"Log: {work}/clone.log")
+    if status == "patched":
+        _trigger_etcd_member_rollout(clone_oc, work)
     return result
+
+
+def _trigger_etcd_member_rollout(clone_oc, work):
+    """Start the operator-controlled etcd rollout after the live bundle is verified."""
+    reason = "reissued-etcd-certs-" + datetime.now().strftime("%Y%m%dT%H%M%S")
+    patch = json.dumps(compact_etcd_force_redeploy_patch(reason))
+    patched = env.run(
+        f"{clone_oc} patch etcd cluster --type=merge -p {shlex.quote(patch)}",
+        check=False)
+    if patched.returncode != 0:
+        sys.exit(f"etcd rollout trigger failed. Log: {work}/clone.log")
+    _clone_log(work, "etcd rollout triggered")
 
 
 def _set_node_identity_webhook(clone_oc, policy):
@@ -2718,12 +2737,11 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
                 f"{shlex.quote(work + '/identity-pairs.json')} {shlex.quote(work + '/rewrite-identity.py')} "
                 f"core@{node['ip']}:/var/tmp/")
             _vm(node["ip"], "sudo python3 /var/tmp/rewrite-identity.py", identity, check=False)
-        _clone_log(work, "publish clone node IPs while the identity webhook restarts")
+        _clone_log(work, "publish clone node IPs without restarting kubelet")
         _publish_clone_addresses(clone_oc, nodes, pairs)
         for node in nodes:
-            _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true; sudo systemctl restart crio", identity, check=False)
+            _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true", identity, check=False)
             _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
-            _vm(node["ip"], "sudo systemctl restart kubelet", identity, check=False)
         _refresh_internal_api_certificate(clone_oc, work, domain, api_vip, nodes, identity)
         _clone_log(work, "replace node identity and ovnkube pods that still use the source API")
         env.run(
@@ -2741,6 +2759,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
     webhook_confirmed = False
     stable_samples = 0
     last_etcd_sample = None
+    last_core_blocker = ""
     while time.time() < deadline:
         for node in nodes:
             _vm(node["ip"],
@@ -2820,6 +2839,15 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
                 f"etcd rollout started={health['etcd_started']} pods={etcd_pods} "
                 f"leader={health['leader']} progressing={'etcd' in core_unhealthy}")
             last_etcd_sample = etcd_sample
+        if core_unhealthy:
+            listed = " ".join(shlex.quote(name) for name in core_unhealthy)
+            raw = env.run(f"{clone_oc} get co {listed} -o json", check=False)
+            blocker = compact_core_blocker_text(raw.stdout or "")
+            if blocker and blocker != last_core_blocker:
+                _clone_log(work, f"core blocker {blocker}")
+                last_core_blocker = blocker
+        else:
+            last_core_blocker = ""
         stable_samples = compact_next_stable_samples(stable_samples, stage, auth_ready, domains_ready)
         if stable_samples == 0:
             reported_stage = stage if stage != "core-ready" else "core"
@@ -3325,6 +3353,26 @@ CORE_OPERATORS = frozenset({
     "network",
     "openshift-apiserver",
 })
+
+
+def compact_core_blocker_text(raw):
+    """Return the progressing and degraded reasons for ClusterOperator JSON."""
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    items = doc.get("items") if isinstance(doc, dict) and "items" in doc else [doc]
+    lines = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = ((item.get("metadata") or {}).get("name")) or "unknown"
+        for condition in (item.get("status") or {}).get("conditions") or []:
+            if condition.get("type") not in ("Progressing", "Degraded") or condition.get("status") != "True":
+                continue
+            message = " ".join((condition.get("message") or "").split())
+            lines.append(f"{name} {condition['type']} {condition.get('reason') or ''} {message}".strip())
+    return " | ".join(lines)
 
 
 def compact_split_operators(unhealthy):

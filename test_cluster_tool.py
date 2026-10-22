@@ -1694,6 +1694,16 @@ class TestCompactInspect(unittest.TestCase):
         self.assertNotIn("_sync_reissued_etcd_certs(", source)
         self.assertNotIn("copy_to_nodes=True", source)
         self.assertNotIn("over the operator revision", source)
+        self.assertNotIn("systemctl restart kubelet", source)
+        self.assertNotIn("systemctl restart crio", source)
+        self.assertIn("publish clone node IPs without restarting kubelet", source)
+        require_source = inspect.getsource(ct._require_reissued_etcd_certs)
+        self.assertLess(
+            require_source.index("etcd certificate inputs"),
+            require_source.index("_trigger_etcd_member_rollout"))
+        self.assertEqual(
+            ct.compact_etcd_force_redeploy_patch("reissued-etcd-certs"),
+            {"spec": {"forceRedeploymentReason": "reissued-etcd-certs"}})
 
         nodes = [{"role": "master-0-0", "ip": "192.168.210.69"}]
         pems = {
@@ -1809,7 +1819,56 @@ class TestCompactInspect(unittest.TestCase):
                     ct._require_reissued_etcd_certs("oc", nodes, "/id", work)
                 self.assertIn("patching etcd-all-certs failed", str(aborted.exception))
                 self.assertFalse(any("patch verified" in cmd for cmd in denied.calls))
+                self.assertFalse(any("patch etcd cluster" in cmd for cmd in denied.calls))
                 self.assertFalse(any("wait for core operators" in cmd for cmd in denied.calls))
+
+                triggered_reads = {"n": 0}
+
+                def trigger_handler(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        triggered_reads["n"] += 1
+                        return _Cmd(0, bundle(pems if triggered_reads["n"] > 1 else old))
+                    if "get secret etcd-" in cmd:
+                        return _Cmd(1, "", "Error from server (NotFound): secret not found")
+                    if "patch etcd cluster" in cmd:
+                        self.assertIn("forceRedeploymentReason", cmd)
+                        return _Cmd()
+                    return _Cmd()
+
+                triggered = _Env(trigger_handler)
+                ct.env = triggered
+                result = ct._require_reissued_etcd_certs("oc", nodes, "/id", work)
+                self.assertEqual(result["bundle"], "patched")
+                trigger_at = next(i for i, cmd in enumerate(triggered.calls) if "patch etcd cluster" in cmd)
+                verified_at = next(i for i, cmd in enumerate(triggered.calls) if "etcd-all-certs patch verified" in cmd)
+                self.assertLess(verified_at, trigger_at)
+
+                current_again = _Env(current_handler)
+                ct.env = current_again
+                result = ct._require_reissued_etcd_certs("oc", nodes, "/id", work)
+                self.assertEqual(result["bundle"], "already-current")
+                self.assertFalse(any("patch etcd cluster" in cmd for cmd in current_again.calls))
+
+                reReads = {"n": 0}
+
+                def trigger_rejected_fixed(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        reReads["n"] += 1
+                        return _Cmd(0, bundle(pems if reReads["n"] > 1 else old))
+                    if "patch secret etcd-all-certs" in cmd:
+                        return _Cmd()
+                    if "patch etcd cluster" in cmd:
+                        return _Cmd(1, "", "denied")
+                    if "get secret etcd-" in cmd:
+                        return _Cmd(1, "", "Error from server (NotFound): secret not found")
+                    return _Cmd()
+
+                rejected_trigger = _Env(trigger_rejected_fixed)
+                ct.env = rejected_trigger
+                with self.assertRaises(SystemExit) as aborted:
+                    ct._require_reissued_etcd_certs("oc", nodes, "/id", work)
+                self.assertIn("etcd rollout trigger failed", str(aborted.exception))
+                self.assertFalse(any("etcd rollout triggered" in cmd for cmd in rejected_trigger.calls))
         finally:
             ct.env = previous
 
@@ -1826,6 +1885,16 @@ class TestCompactInspect(unittest.TestCase):
         self.assertEqual(ct.compact_next_stable_samples(1, "core", True, True), 0)
         self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", False, True), 0)
         self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", True, False), 0)
+        blocker = ct.compact_core_blocker_text(json.dumps({"items": [{
+            "metadata": {"name": "kube-apiserver"},
+            "status": {"conditions": [
+                {"type": "Progressing", "status": "True", "reason": "NodeInstallerProgressing",
+                 "message": "NodeInstallerProgressing: 1 nodes are at revision 7, 2 nodes are at revision 8"},
+                {"type": "Degraded", "status": "False", "reason": "AsExpected", "message": "ignored"},
+            ]},
+        }]}))
+        self.assertIn("kube-apiserver Progressing NodeInstallerProgressing", blocker)
+        self.assertNotIn("ignored", blocker)
 
     def test_compact_boot_refuses_before_the_sno_path(self):
         class _State:
