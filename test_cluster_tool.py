@@ -1688,7 +1688,7 @@ class TestCompactInspect(unittest.TestCase):
         source = inspect.getsource(ct._finish_compact_clone)
         sign = source.index("sign kubelet certificates with the live CSR signer")
         rewrite = source.index("rewrite cluster records and 00-master")
-        health = source.index("wait for core operators; etcd must stay up for two samples")
+        health = source.index("wait until etcd and the API revisions are installed for vmaas")
         requires = []
         start = 0
         while True:
@@ -1709,6 +1709,7 @@ class TestCompactInspect(unittest.TestCase):
         self.assertNotIn("systemctl restart kubelet", source)
         self.assertNotIn("systemctl restart crio", source)
         self.assertIn("publish clone node IPs without restarting kubelet", source)
+        self.assertNotIn("is core-ready", source)
         require_source = inspect.getsource(ct._require_reissued_etcd_certs)
         self.assertLess(
             require_source.index("etcd certificate inputs"),
@@ -1815,7 +1816,7 @@ class TestCompactInspect(unittest.TestCase):
                         "/plan", {}, "192.168.210.81", "/src", [], start_at="rewrite")
                 self.assertIn("reading etcd-all-certs failed", str(aborted.exception))
                 self.assertFalse(any("rewrite cluster records" in cmd for cmd in failed.calls))
-                self.assertFalse(any("wait for core operators" in cmd for cmd in failed.calls))
+                self.assertFalse(any("wait until etcd and the API revisions" in cmd for cmd in failed.calls))
                 self.assertEqual(patches(failed.calls), [])
 
                 def patch_fails(cmd):
@@ -1832,7 +1833,7 @@ class TestCompactInspect(unittest.TestCase):
                 self.assertIn("patching etcd-all-certs failed", str(aborted.exception))
                 self.assertFalse(any("patch verified" in cmd for cmd in denied.calls))
                 self.assertFalse(any("patch etcd cluster" in cmd for cmd in denied.calls))
-                self.assertFalse(any("wait for core operators" in cmd for cmd in denied.calls))
+                self.assertFalse(any("wait until etcd and the API revisions" in cmd for cmd in denied.calls))
 
                 triggered_reads = {"n": 0}
 
@@ -1897,6 +1898,32 @@ class TestCompactInspect(unittest.TestCase):
         self.assertEqual(ct.compact_next_stable_samples(1, "core", True, True), 0)
         self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", False, True), 0)
         self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", True, False), 0)
+        self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", True, True, False), 0)
+        self.assertEqual(ct.compact_install_blockers(["ingress", "insights", "console"]), ["ingress"])
+        quiet = {
+            "status": {
+                "latestAvailableRevision": 12,
+                "nodeStatuses": [
+                    {"currentRevision": 12, "targetRevision": 12},
+                    {"currentRevision": 12, "targetRevision": 12},
+                    {"currentRevision": 12, "targetRevision": 12},
+                ],
+            },
+        }
+        pending = {
+            "status": {
+                "latestAvailableRevision": 12,
+                "nodeStatuses": [
+                    {"currentRevision": 10, "targetRevision": 12},
+                    {"currentRevision": 12, "targetRevision": 12},
+                    {"currentRevision": 12, "targetRevision": 12},
+                ],
+            },
+        }
+        self.assertTrue(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), 10))
+        self.assertTrue(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), None))
+        self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), 12))
+        self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(pending), 10))
         blocker = ct.compact_core_blocker_text(json.dumps({"items": [{
             "metadata": {"name": "kube-apiserver"},
             "status": {"conditions": [

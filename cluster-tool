@@ -2433,12 +2433,22 @@ def _require_reissued_etcd_certs(clone_oc, nodes, identity, work):
             f"etcd certificate inputs {status}{detail}. "
             f"Log: {work}/clone.log")
     if status == "patched":
-        _trigger_etcd_member_rollout(clone_oc, work)
+        result["etcd_revision_baseline"] = _trigger_etcd_member_rollout(clone_oc, work)
     return result
+
+
+def _operator_latest_revision(clone_oc, name):
+    """Read one operator's latest static-pod revision."""
+    raw = env.run(
+        f"{clone_oc} get co {shlex.quote(name)} -o jsonpath='{{.status.latestAvailableRevision}}'",
+        check=False)
+    text = (raw.stdout or "").strip().strip("'")
+    return int(text) if text.isdigit() else None
 
 
 def _trigger_etcd_member_rollout(clone_oc, work):
     """Start the operator-controlled etcd rollout after the live bundle is verified."""
+    baseline = _operator_latest_revision(clone_oc, "etcd")
     reason = "reissued-etcd-certs-" + datetime.now().strftime("%Y%m%dT%H%M%S")
     patch = json.dumps(compact_etcd_force_redeploy_patch(reason))
     patched = env.run(
@@ -2446,7 +2456,8 @@ def _trigger_etcd_member_rollout(clone_oc, work):
         check=False)
     if patched.returncode != 0:
         sys.exit(f"etcd rollout trigger failed. Log: {work}/clone.log")
-    _clone_log(work, "etcd rollout triggered")
+    _clone_log(work, f"etcd rollout triggered from revision {baseline}")
+    return baseline
 
 
 def _set_node_identity_webhook(clone_oc, policy):
@@ -2499,6 +2510,8 @@ def _publish_clone_addresses(clone_oc, nodes, pairs):
 
 def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn, plan_path, by_role, api_ip, src_kc, pairs, start_at=None):
     """Finish certificate heal, identity rewrite, and the compact health wait."""
+    etcd_revision_baseline = None
+    apiserver_revision_baseline = None
     if start_at == "health":
         _clone_log(work, "resume at the health check")
     elif start_at == "rewrite":
@@ -2588,7 +2601,9 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         _vm(recert_node["ip"], compact_start_recert_node_script(), identity, check=False)
         _wait_admin_auth(src_kc, recert_node)
         early_oc = _oc(src_kc, f"https://{api_ip}:6443")
-        _require_reissued_etcd_certs(early_oc, nodes, identity, work)
+        certs = _require_reissued_etcd_certs(early_oc, nodes, identity, work)
+        if certs.get("etcd_revision_baseline") is not None:
+            etcd_revision_baseline = certs["etcd_revision_baseline"]
         _sync_requestheader_aggregator_ca(src_kc, api_ip, work, identity, quorum["ip"])
 
         _clone_log(work, "sign kubelet certificates with the live CSR signer")
@@ -2632,7 +2647,9 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
     clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
     if start_at == "rewrite":
-        _require_reissued_etcd_certs(clone_oc, nodes, identity, work)
+        certs = _require_reissued_etcd_certs(clone_oc, nodes, identity, work)
+        if certs.get("etcd_revision_baseline") is not None:
+            etcd_revision_baseline = certs["etcd_revision_baseline"]
     if start_at != "health":
         _clone_log(work, "rewrite cluster records and 00-master")
         domain = f"test-infra-cluster-{clone_id}.redhat.com"
@@ -2752,6 +2769,8 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         for node in nodes:
             _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true", identity, check=False)
             _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
+        apiserver_revision_baseline = _operator_latest_revision(clone_oc, "kube-apiserver")
+        _clone_log(work, f"kube-apiserver revision baseline {apiserver_revision_baseline}")
         _refresh_internal_api_certificate(clone_oc, work, domain, api_vip, nodes, identity)
         _clone_log(work, "replace node identity and ovnkube pods that still use the source API")
         env.run(
@@ -2761,7 +2780,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             f"{clone_oc} delete pod -n openshift-ovn-kubernetes -l app=ovnkube-node --force --grace-period=0",
             check=False)
 
-    _clone_log(work, "wait for core operators; etcd must stay up for two samples")
+    _clone_log(work, "wait until etcd and the API revisions are installed for vmaas")
     deadline = time.time() + 40 * 60
     last = None
     last_auth = "unchecked"
@@ -2770,6 +2789,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
     stable_samples = 0
     last_etcd_sample = None
     last_core_blocker = ""
+    last_revision_sample = None
     while time.time() < deadline:
         for node in nodes:
             _vm(node["ip"],
@@ -2816,8 +2836,19 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         )
         last = health
         core_unhealthy, post_unhealthy = compact_split_operators(health["unhealthy_operators"])
+        install_blockers = compact_install_blockers(health["unhealthy_operators"])
         stage = compact_readiness_stage(
             health["ready"], addresses_ok, health["etcd_started"], etcd_pods, health["leader"], core_unhealthy)
+        revision_raw = env.run(
+            f"{clone_oc} get co etcd kube-apiserver -o json",
+            check=False)
+        revisions = compact_operator_docs(revision_raw.stdout or "")
+        etcd_revision = compact_static_pod_revision(revisions.get("etcd"))
+        apiserver_revision = compact_static_pod_revision(revisions.get("kube-apiserver"))
+        revisions_ready = (
+            compact_static_pod_rollout_ready(etcd_revision, etcd_revision_baseline)
+            and compact_static_pod_rollout_ready(apiserver_revision, apiserver_revision_baseline)
+        )
         admin_auth = compact_admin_auth_results(clone_kc, nodes)
         admin_failed = [item["role"] for item in admin_auth if not item["ok"]]
         sa_failed = []
@@ -2849,8 +2880,20 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
                 f"etcd rollout started={health['etcd_started']} pods={etcd_pods} "
                 f"leader={health['leader']} progressing={'etcd' in core_unhealthy}")
             last_etcd_sample = etcd_sample
-        if core_unhealthy:
-            listed = " ".join(shlex.quote(name) for name in core_unhealthy)
+        revision_sample = (
+            etcd_revision.get("latest"), etcd_revision.get("converged"),
+            apiserver_revision.get("latest"), apiserver_revision.get("converged"),
+        )
+        if revision_sample != last_revision_sample:
+            _clone_log(
+                work,
+                f"install revisions etcd={etcd_revision.get('latest')}/{etcd_revision_baseline} "
+                f"converged={etcd_revision.get('converged')} "
+                f"kube-apiserver={apiserver_revision.get('latest')}/{apiserver_revision_baseline} "
+                f"converged={apiserver_revision.get('converged')}")
+            last_revision_sample = revision_sample
+        if core_unhealthy or install_blockers:
+            listed = " ".join(shlex.quote(name) for name in dict.fromkeys(core_unhealthy + install_blockers))
             raw = env.run(f"{clone_oc} get co {listed} -o json", check=False)
             blocker = compact_core_blocker_text(raw.stdout or "")
             if blocker and blocker != last_core_blocker:
@@ -2858,32 +2901,35 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
                 last_core_blocker = blocker
         else:
             last_core_blocker = ""
-        stable_samples = compact_next_stable_samples(stable_samples, stage, auth_ready, domains_ready)
+        install_ready = not install_blockers and revisions_ready
+        stable_samples = compact_next_stable_samples(
+            stable_samples, stage, auth_ready, domains_ready, install_ready)
         if stable_samples == 0:
-            reported_stage = stage if stage != "core-ready" else "core"
+            if stage != "core-ready":
+                reported_stage = stage
+            elif not install_ready:
+                reported_stage = "install"
+            else:
+                reported_stage = "core"
         else:
-            reported_stage = "ready" if not post_unhealthy else "post-boot"
+            reported_stage = "ready"
         _clone_log(
             work,
             f"health stage={reported_stage} stable={stable_samples} "
             f"ready={health['ready']} etcd={health['etcd_started']} leader={health['leader']} "
             f"etcdpods={etcd_pods} ips={'ok' if addresses_ok else 'stale'} "
-            f"core={','.join(core_unhealthy) or 'none'} post={','.join(post_unhealthy) or 'none'} "
+            f"core={','.join(core_unhealthy) or 'none'} "
+            f"install={','.join(install_blockers) or 'none'} "
             f"auth={auth_detail} {domain_detail}")
         if stable_samples == 1 and nni_ready and not webhook_confirmed:
             _set_node_identity_webhook(clone_oc, "Fail")
             webhook_confirmed = True
-        if stable_samples >= 2 and reported_stage in ("ready", "post-boot"):
-            if reported_stage == "post-boot":
-                _clone_log(
-                    work,
-                    f"Compact clone {clone_id} is core-ready. Still progressing: "
-                    f"{','.join(post_unhealthy)}. Log: {work}/clone.log")
-            elif "insights" in health["unhealthy_operators"]:
+        if stable_samples >= 2 and reported_stage == "ready":
+            if "insights" in health["unhealthy_operators"]:
                 _clone_log(
                     work,
                     f"Compact clone {clone_id} is up. insights is Degraded because the Red Hat "
-                    f"upload token is rejected. Every other ClusterOperator is green. Log: {work}/clone.log")
+                    f"upload token is rejected. Every other install operator is quiet. Log: {work}/clone.log")
             else:
                 _clone_log(work, f"Compact clone {clone_id} is healthy. Log: {work}/clone.log")
             return health
@@ -3365,6 +3411,59 @@ CORE_OPERATORS = frozenset({
 })
 
 
+INSTALL_OPERATORS = CORE_OPERATORS | frozenset({
+    "ingress",
+    "operator-lifecycle-manager",
+    "operator-lifecycle-manager-catalog",
+    "operator-lifecycle-manager-packageserver",
+})
+
+
+def compact_operator_docs(raw):
+    """Index ClusterOperator JSON objects by name."""
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    items = doc.get("items") if isinstance(doc, dict) and "items" in doc else [doc]
+    found = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("metadata") or {}).get("name")
+        if name:
+            found[name] = item
+    return found
+
+
+def compact_static_pod_revision(operator_doc):
+    """Return the latest static-pod revision and whether every node is on it."""
+    status = (operator_doc or {}).get("status") or {}
+    latest = status.get("latestAvailableRevision")
+    nodes = status.get("nodeStatuses") or []
+    if not isinstance(latest, int):
+        return {"latest": None, "converged": False}
+    converged = len(nodes) >= len(COMPACT_ROLES) and all(
+        node.get("currentRevision") == latest and node.get("targetRevision", latest) == latest
+        for node in nodes
+    )
+    return {"latest": latest, "converged": converged}
+
+
+def compact_static_pod_rollout_ready(revision, baseline):
+    """Require every node on the latest revision, and a newer revision after a requested rollout."""
+    if not revision or not revision.get("converged") or not isinstance(revision.get("latest"), int):
+        return False
+    if isinstance(baseline, int) and revision["latest"] <= baseline:
+        return False
+    return True
+
+
+def compact_install_blockers(unhealthy):
+    """Return operators that still block a vmaas install. insights is allowed."""
+    return [name for name in unhealthy if name in INSTALL_OPERATORS]
+
+
 def compact_core_blocker_text(raw):
     """Return the progressing and degraded reasons for ClusterOperator JSON."""
     try:
@@ -3403,9 +3502,9 @@ def compact_readiness_stage(ready, addresses_ok, etcd_started, etcd_pods, leader
     return "core-ready"
 
 
-def compact_next_stable_samples(stable_samples, stage, auth_ready, domains_ready):
-    """Advance the core stability count, or reset it when a core condition regresses."""
-    if stage != "core-ready" or not auth_ready or not domains_ready:
+def compact_next_stable_samples(stable_samples, stage, auth_ready, domains_ready, install_ready=True):
+    """Advance the stability count, or reset it when an install requirement regresses."""
+    if stage != "core-ready" or not auth_ready or not domains_ready or not install_ready:
         return 0
     return stable_samples + 1
 
