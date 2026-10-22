@@ -2012,6 +2012,27 @@ class TestCompactInspect(unittest.TestCase):
         self.assertEqual(ct.compact_revision_from_text(
             "NodeInstallerProgressing: 3 nodes are at revision 10; 0 nodes have achieved new revision 12"
         ), {"latest": 12, "current": 10, "converged": False})
+        quiet_docs = {
+            "etcd": {"status": {"conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Progressing", "status": "False"},
+                {"type": "Degraded", "status": "False"},
+            ]}},
+            "ingress": {"status": {"conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Progressing", "status": "True"},
+                {"type": "Degraded", "status": "False"},
+            ]}},
+        }
+        observed = {op["name"]: op for op in ct.compact_operators_from_docs(quiet_docs)}
+        self.assertEqual(observed["etcd"]["progressing"], "False")
+        self.assertEqual(observed["ingress"]["progressing"], "True")
+        self.assertFalse(ct.compact_install_observation_ready(3, True, [], ["ingress"], True))
+        self.assertFalse(ct.compact_install_observation_ready(3, True, [], [], False))
+        self.assertTrue(ct.compact_install_observation_ready(3, True, [], [], True))
+        finish = inspect.getsource(ct._finish_compact_clone)
+        self.assertLess(finish.index("_wait_master_render"), finish.index("_ensure_api_certificates"))
+        self.assertNotIn("time.sleep(30)", finish)
 
     def test_health_resume_requires_saved_revision_baselines(self):
         self.assertIsNone(ct.compact_valid_revision_baselines(None))
