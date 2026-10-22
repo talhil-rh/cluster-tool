@@ -1924,6 +1924,28 @@ class TestCompactInspect(unittest.TestCase):
         self.assertTrue(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), None))
         self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), 12))
         self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(pending), 10))
+        settled = {"status": {"conditions": [
+            {"type": "Progressing", "status": "False",
+             "message": "NodeInstallerProgressing: 3 nodes are at revision 13"},
+            {"type": "Available", "status": "True",
+             "message": "StaticPodsAvailable: 3 nodes are active; 3 nodes are at revision 13"},
+        ]}}
+        rolling = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 3 nodes are at revision 10; 0 nodes have achieved new revision 12"},
+        ]}}
+        split = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 2 nodes are at revision 5; 1 node is at revision 8"},
+        ]}}
+        self.assertEqual(ct.compact_static_pod_revision(settled)["current"], 13)
+        self.assertTrue(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(settled), 10))
+        self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(settled), 13))
+        self.assertEqual(ct.compact_static_pod_revision(rolling)["current"], 10)
+        self.assertEqual(ct.compact_static_pod_revision(rolling)["latest"], 12)
+        self.assertFalse(ct.compact_static_pod_revision(rolling)["converged"])
+        self.assertFalse(ct.compact_static_pod_revision(split)["converged"])
+        self.assertEqual(ct.compact_static_pod_revision(split)["latest"], 8)
         blocker = ct.compact_core_blocker_text(json.dumps({"items": [{
             "metadata": {"name": "kube-apiserver"},
             "status": {"conditions": [

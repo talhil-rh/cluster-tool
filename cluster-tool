@@ -20,6 +20,7 @@ from pathlib import Path
 import ipaddress
 import socket
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 
 REMOTE_BASE = None
 REMOTE_OVERLAYS = None
@@ -1972,8 +1973,8 @@ def _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity)
     """Restart the cert controller and wait until the API presents the clone name."""
     hostname = f"api-int.{domain}"
     _clone_log(work, "restart the API cert controller so it re-reads the clone API name")
-    for node in nodes:
-        _vm(node["ip"], compact_restart_cert_controller_command(), identity, check=False)
+    _in_parallel(nodes, lambda node: _vm(
+        node["ip"], compact_restart_cert_controller_command(), identity, check=False))
     namespace, lease = compact_cert_controller_lease()
     released = env.run(
         f"{oc} delete lease {shlex.quote(lease)} -n {shlex.quote(namespace)} --ignore-not-found",
@@ -2119,6 +2120,24 @@ def _wait_ssh(ip, identity, attempts=60):
             return
         time.sleep(5)
     sys.exit(f"SSH to {ip} did not come up")
+
+
+def _in_parallel(items, fn):
+    """Run one independent action per item at the same time."""
+    if not items:
+        return
+    errors = []
+
+    def invoke(item):
+        try:
+            fn(item)
+        except SystemExit as exc:
+            errors.append(str(exc) or "parallel step failed")
+
+    with ThreadPoolExecutor(max_workers=len(items)) as pool:
+        list(pool.map(invoke, items))
+    if errors:
+        sys.exit(errors[0])
 
 
 def _oc(kubeconfig, server):
@@ -2438,12 +2457,15 @@ def _require_reissued_etcd_certs(clone_oc, nodes, identity, work):
 
 
 def _operator_latest_revision(clone_oc, name):
-    """Read one operator's latest static-pod revision."""
-    raw = env.run(
-        f"{clone_oc} get co {shlex.quote(name)} -o jsonpath='{{.status.latestAvailableRevision}}'",
-        check=False)
-    text = (raw.stdout or "").strip().strip("'")
-    return int(text) if text.isdigit() else None
+    """Read the revision currently installed for one static-pod operator."""
+    raw = env.run(f"{clone_oc} get co {shlex.quote(name)} -o json", check=False)
+    if raw.returncode != 0 or not (raw.stdout or "").strip():
+        return None
+    try:
+        doc = json.loads(raw.stdout)
+    except json.JSONDecodeError:
+        return None
+    return compact_static_pod_revision(doc).get("current")
 
 
 def _trigger_etcd_member_rollout(clone_oc, work):
@@ -2758,17 +2780,23 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         _clone_log(work, "rewrite etcd pod manifests laid down by the operator")
         env.write_file(f"{work}/identity-pairs.json", json.dumps(pairs))
         env.write_file(f"{work}/rewrite-identity.py", compact_identity_script())
-        for node in nodes:
+
+        def rewrite_node(node):
             env.run(
                 "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
                 f"{shlex.quote(work + '/identity-pairs.json')} {shlex.quote(work + '/rewrite-identity.py')} "
                 f"core@{node['ip']}:/var/tmp/")
             _vm(node["ip"], "sudo python3 /var/tmp/rewrite-identity.py", identity, check=False)
+
+        _in_parallel(nodes, rewrite_node)
         _clone_log(work, "publish clone node IPs without restarting kubelet")
         _publish_clone_addresses(clone_oc, nodes, pairs)
-        for node in nodes:
+
+        def refresh_node_address(node):
             _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true", identity, check=False)
             _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
+
+        _in_parallel(nodes, refresh_node_address)
         apiserver_revision_baseline = _operator_latest_revision(clone_oc, "kube-apiserver")
         _clone_log(work, f"kube-apiserver revision baseline {apiserver_revision_baseline}")
         _refresh_internal_api_certificate(clone_oc, work, domain, api_vip, nodes, identity)
@@ -2967,10 +2995,11 @@ def _start_compact_clone(source, clone_id, subnet, nodes, macs, identity, work, 
         env.run(f"virsh start {shlex.quote(node['domain'])}")
 
     _clone_log(work, "wait for SSH and stop kubelet before etcd restore")
-    for node in nodes:
-        _wait_ssh(node["ip"], identity)
-        _vm(node["ip"], compact_stop_workloads_script(), identity)
-        _vm(node["ip"], "sudo systemctl stop chrony-wait.service || true", identity, check=False)
+    _in_parallel(nodes, lambda node: (
+        _wait_ssh(node["ip"], identity),
+        _vm(node["ip"], compact_stop_workloads_script(), identity),
+        _vm(node["ip"], "sudo systemctl stop chrony-wait.service || true", identity, check=False),
+    ))
 
     _clone_log(work, "reissue etcd certificates for the clone IPs")
     reissue = compact_etcd_reissue_script(nodes, crypto, f"{work}/etcd-new")
@@ -2984,7 +3013,8 @@ def _start_compact_clone(source, clone_id, subnet, nodes, macs, identity, work, 
     env.write_file(f"{work}/rewrite-identity.py", compact_identity_script())
     restore_commands = compact_etcd_restore_commands(
         nodes, "/snapshot.db", clone_id, data_root="/restore", skip_hash_check=skip_hash_check)
-    for node, restore in zip(nodes, restore_commands):
+    def restore_one(item):
+        node, restore = item
         _clone_log(work, f"restore etcd and rewrite files on {node['role']}")
         env.run(
             "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
@@ -3018,8 +3048,11 @@ def _start_compact_clone(source, clone_id, subnet, nodes, macs, identity, work, 
             sudo python3 /var/tmp/rewrite-identity.py
             """), identity)
 
+    _in_parallel(list(zip(nodes, restore_commands)), restore_one)
+
     _clone_log(work, "copy every member certificate onto all three nodes")
-    for node in nodes:
+
+    def install_member_certs(node):
         for other in nodes:
             env.run(
                 "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
@@ -3029,6 +3062,8 @@ def _start_compact_clone(source, clone_id, subnet, nodes, macs, identity, work, 
         _vm(node["ip"], compact_install_etcd_certs_script() + "sudo systemctl start crio\n", identity)
         _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
         _vm(node["ip"], "sudo systemctl start kubelet", identity)
+
+    _in_parallel(nodes, install_member_certs)
 
     _clone_log(work, "wait for the clone API")
     api_ip = by_role[QUORUM_ETCD_ROLE]["ip"]
@@ -3436,18 +3471,59 @@ def compact_operator_docs(raw):
     return found
 
 
+def compact_revision_from_text(text):
+    """Read a static-pod revision from a ClusterOperator condition message.
+
+    OpenShift 4.22 reports the revision only in that message, for example
+    "3 nodes are at revision 13" or "3 nodes are at revision 10; 0 nodes have
+    achieved new revision 12".
+    """
+    at_revision = []
+    pending = []
+    for match in re.finditer(
+        r"(\d+) nodes? (are at revision|is at revision|have achieved new revision) (\d+)",
+        text or "",
+        re.I,
+    ):
+        count, kind, revision = int(match.group(1)), match.group(2).lower(), int(match.group(3))
+        if "achieved" in kind:
+            if count == 0:
+                pending.append(revision)
+            else:
+                at_revision.append((count, revision))
+        else:
+            at_revision.append((count, revision))
+    if not at_revision and not pending:
+        return {"latest": None, "current": None, "converged": False}
+    current = max(at_revision, key=lambda item: item[0])[1] if at_revision else None
+    revisions = {revision for _, revision in at_revision}
+    settled = (
+        not pending
+        and len(revisions) == 1
+        and max(count for count, _ in at_revision) >= len(COMPACT_ROLES)
+    )
+    mentioned = [revision for _, revision in at_revision] + pending
+    latest = current if settled else max(mentioned)
+    return {"latest": latest, "current": current, "converged": settled}
+
+
 def compact_static_pod_revision(operator_doc):
     """Return the latest static-pod revision and whether every node is on it."""
     status = (operator_doc or {}).get("status") or {}
     latest = status.get("latestAvailableRevision")
     nodes = status.get("nodeStatuses") or []
-    if not isinstance(latest, int):
-        return {"latest": None, "converged": False}
-    converged = len(nodes) >= len(COMPACT_ROLES) and all(
-        node.get("currentRevision") == latest and node.get("targetRevision", latest) == latest
-        for node in nodes
-    )
-    return {"latest": latest, "converged": converged}
+    if isinstance(latest, int) and len(nodes) >= len(COMPACT_ROLES):
+        converged = all(
+            node.get("currentRevision") == latest and node.get("targetRevision", latest) == latest
+            for node in nodes
+        )
+        return {"latest": latest, "current": latest if converged else None, "converged": converged}
+    messages = [
+        condition.get("message") or ""
+        for condition in status.get("conditions") or []
+        if condition.get("type") in ("Progressing", "Available")
+    ]
+    return compact_revision_from_text(" ".join(messages))
 
 
 def compact_static_pod_rollout_ready(revision, baseline):
