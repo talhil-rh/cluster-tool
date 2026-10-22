@@ -1585,6 +1585,17 @@ class TestCompactInspect(unittest.TestCase):
         kept = ct.apply_identity_preserving_pems(pem, pairs)
         self.assertIn("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----", kept)
         self.assertIn("test-infra-cluster-ctcmp03.redhat.com", kept)
+        indented = (
+            "additionalTrustBundle: |-\n"
+            "  -----BEGIN CERTIFICATE-----\n"
+            "  MIIB\n"
+            "  -----END CERTIFICATE-----\n"
+            "additionalTrustBundlePolicy: Proxyonly\n"
+            "baseDomain: test-infra-cluster-mno2.redhat.com\n")
+        rewritten_bundle = ct.apply_identity_preserving_pems(indented, pairs)
+        self.assertIn("\n  -----BEGIN CERTIFICATE-----\n  MIIB\n  -----END CERTIFICATE-----\n", rewritten_bundle)
+        self.assertIn("additionalTrustBundlePolicy: Proxyonly\n", rewritten_bundle)
+        self.assertIn("baseDomain: test-infra-cluster-ctcmp03.redhat.com\n", rewritten_bundle)
 
     def test_compact_health_requires_three_nodes_and_operators(self):
         nodes = ct.parse_oc_nodes(
@@ -1604,6 +1615,35 @@ class TestCompactInspect(unittest.TestCase):
         self.assertFalse(health["ok"])
         self.assertEqual(health["unhealthy_operators"], ["machine-config"])
         self.assertTrue(ct.compact_health(nodes, etcd, good)["ok"])
+        self.assertEqual(
+            ct.compact_node_address_patch("192.168.204.81")["status"]["addresses"][0]["address"],
+            "192.168.204.81")
+        machine = json.dumps({"status": {"addresses": [{"type": "InternalIP", "address": "192.168.123.65"}]}})
+        patched = json.loads(ct.compact_status_address_patch(machine, [("192.168.123.65", "192.168.204.81")]))
+        self.assertEqual(patched["status"]["addresses"][0]["address"], "192.168.204.81")
+        host = json.dumps({"status": {"hardware": {"nics": [{"ip": "192.168.123.65", "name": "ens3"}]}}})
+        hardware = json.loads(ct.compact_bmh_hardware_patch(host, [("192.168.123.65", "192.168.204.81")]))
+        self.assertEqual(hardware[0]["value"]["nics"][0]["ip"], "192.168.204.81")
+        self.assertEqual(ct.compact_webhook_failure_patch("Ignore")[0]["value"], "Ignore")
+        wide = ct.parse_oc_nodes(
+            "master-0-0 Ready control-plane,master,worker 5h v1.35.8 192.168.204.69 <none>\n"
+            "master-0-1 Ready control-plane,master,worker 5h v1.35.8 192.168.204.81 <none>\n"
+            "master-0-2 Ready control-plane,master,worker 5h v1.35.8 192.168.123.50 <none>\n")
+        self.assertFalse(ct.compact_node_ips_ready(wide, [
+            {"role": "master-0-0", "ip": "192.168.204.69"},
+            {"role": "master-0-1", "ip": "192.168.204.81"},
+            {"role": "master-0-2", "ip": "192.168.204.89"},
+        ]))
+        wide[2]["ip"] = "192.168.204.89"
+        self.assertTrue(ct.compact_node_ips_ready(wide, [
+            {"role": "master-0-0", "ip": "192.168.204.69"},
+            {"role": "master-0-1", "ip": "192.168.204.81"},
+            {"role": "master-0-2", "ip": "192.168.204.89"},
+        ]))
+        self.assertEqual(ct.parse_etcd_pods(
+            "etcd-master-0-0 5/5 Running 0 1m\n"
+            "etcd-master-0-1 0/5 Pending 0 1m\n"
+            "etcd-guard-master-0-0 1/1 Running 0 1m\n"), 1)
 
     def test_compact_boot_refuses_before_the_sno_path(self):
         class _State:

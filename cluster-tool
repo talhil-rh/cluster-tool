@@ -789,10 +789,10 @@ def apply_identity_preserving_pems(text, pairs):
 
     def hold(match):
         pems.append(match.group(0))
-        return f"\n__CT_PEM_{len(pems) - 1}__\n"
+        return f"__CT_PEM_{len(pems) - 1}__"
 
     protected = re.sub(
-        r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----",
+        r"[ \t]*-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----",
         hold, text, flags=re.S)
     updated = apply_identity(protected, pairs)
     for index, pem in enumerate(pems):
@@ -1032,6 +1032,10 @@ HEAL_CONFIGMAP_PREFIXES = (
     ("openshift-kube-apiserver", "config-"),
     ("openshift-kube-controller-manager", "controller-manager-kubeconfig-"),
     ("openshift-kube-scheduler", "scheduler-kubeconfig-"),
+    ("openshift-etcd", "etcd-pod"),
+    ("openshift-etcd", "etcd-endpoints"),
+    ("openshift-etcd", "restore-etcd-pod"),
+    ("openshift-etcd", "etcd-scripts"),
 )
 
 
@@ -1692,6 +1696,53 @@ def compact_infrastructure_patches(clone_id, subnet):
     return spec, status
 
 
+NODE_IDENTITY_WEBHOOK = "network-node-identity.openshift.io"
+
+
+def compact_node_address_patch(ip):
+    """Build the node status patch that publishes one clone address."""
+    return {"status": {"addresses": [{"type": "InternalIP", "address": ip}]}}
+
+
+def compact_webhook_failure_patch(policy):
+    """Build the JSON patch for the node-identity webhook failure policy."""
+    return [{"op": "replace", "path": "/webhooks/0/failurePolicy", "value": policy}]
+
+
+def compact_status_address_patch(raw, pairs):
+    """Rewrite status addresses and return a status merge patch."""
+    doc = json.loads(apply_identity(raw, pairs))
+    addresses = (doc.get("status") or {}).get("addresses") or []
+    return json.dumps({"status": {"addresses": addresses}})
+
+
+def compact_bmh_hardware_patch(raw, pairs):
+    """Rewrite a BareMetalHost hardware inventory and return a status JSON patch."""
+    doc = json.loads(apply_identity(raw, pairs))
+    hardware = (doc.get("status") or {}).get("hardware") or {}
+    return json.dumps([{"op": "replace", "path": "/status/hardware", "value": hardware}])
+
+
+def compact_node_ips_ready(rows, nodes):
+    """Return whether every clone node object shows its clone address."""
+    expected = {node["role"]: node["ip"] for node in nodes}
+    found = {row["name"]: row.get("ip") for row in rows}
+    return all(found.get(role) == ip for role, ip in expected.items())
+
+
+def parse_etcd_pods(text):
+    """Count etcd static pods whose containers are all running."""
+    ready = 0
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].startswith("etcd-master-"):
+            continue
+        have, _, want = parts[1].partition("/")
+        if parts[2] == "Running" and have == want and have not in ("", "0"):
+            ready += 1
+    return ready
+
+
 def compact_identity_configmaps(oc):
     """List identity ConfigMaps that still need compact address rewrites."""
     found = [list(item) for item in HEAL_IDENTITY_CONFIGMAPS]
@@ -2149,6 +2200,54 @@ PY""",
     _clone_log(work, "aggregated API trust still has a second aggregator CA")
 
 
+def _set_node_identity_webhook(clone_oc, policy):
+    """Set the node-identity webhook failure policy."""
+    env.run(
+        f"{clone_oc} patch validatingwebhookconfiguration {NODE_IDENTITY_WEBHOOK} --type=json "
+        f"-p {shlex.quote(json.dumps(compact_webhook_failure_patch(policy)))}",
+        check=False)
+
+
+def _publish_clone_addresses(clone_oc, nodes, pairs):
+    """Publish clone addresses on the node, machine, and baremetal host."""
+    _set_node_identity_webhook(clone_oc, "Ignore")
+    for node in nodes:
+        env.run(
+            f"{clone_oc} patch node {shlex.quote(node['role'])} --subresource=status --type=merge "
+            f"-p {shlex.quote(json.dumps(compact_node_address_patch(node['ip'])))}",
+            check=False)
+        env.run(
+            f"{clone_oc} annotate node {shlex.quote(node['role'])} "
+            f"k8s.ovn.org/node-encap-ips={shlex.quote(json.dumps([node['ip']]))} --overwrite",
+            check=False)
+    listed = env.run(f"{clone_oc} get nodes -o json", check=False)
+    if listed.returncode == 0 and listed.stdout.strip():
+        for item in json.loads(listed.stdout).get("items") or []:
+            machine = ((item.get("metadata") or {}).get("annotations") or {}).get("machine.openshift.io/machine")
+            if not machine or "/" not in machine:
+                continue
+            namespace, name = machine.split("/", 1)
+            body = env.run(
+                f"{clone_oc} get machine {shlex.quote(name)} -n {shlex.quote(namespace)} -o json",
+                check=False)
+            if body.returncode != 0 or not body.stdout.strip():
+                continue
+            env.run(
+                f"{clone_oc} patch machine {shlex.quote(name)} -n {shlex.quote(namespace)} "
+                "--subresource=status --type=merge "
+                f"-p {shlex.quote(compact_status_address_patch(body.stdout, pairs))}",
+                check=False)
+    hosts = env.run(f"{clone_oc} get baremetalhosts -n openshift-machine-api -o json", check=False)
+    if hosts.returncode == 0 and hosts.stdout.strip():
+        for item in json.loads(hosts.stdout).get("items") or []:
+            name = item["metadata"]["name"]
+            env.run(
+                f"{clone_oc} patch baremetalhost {shlex.quote(name)} -n openshift-machine-api "
+                "--subresource=status --type=json "
+                f"-p {shlex.quote(compact_bmh_hardware_patch(json.dumps(item), pairs))}",
+                check=False)
+
+
 def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn, plan_path, by_role, api_ip, src_kc, pairs, start_at=None):
     """Finish certificate heal, identity rewrite, and the compact health wait."""
     if start_at == "health":
@@ -2386,24 +2485,49 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         compact_apply_clone_ingress_domain(clone_oc, clone_id, work)
         _sync_ingress_wildcard(clone_oc, clone_id, work)
         _ensure_api_certificates(clone_oc, work, domain, api_vip, nodes, identity)
+        _clone_log(work, "rewrite etcd pod manifests laid down by the operator")
+        env.write_file(f"{work}/identity-pairs.json", json.dumps(pairs))
+        env.write_file(f"{work}/rewrite-identity.py", compact_identity_script())
+        for node in nodes:
+            env.run(
+                "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
+                f"{shlex.quote(work + '/identity-pairs.json')} {shlex.quote(work + '/rewrite-identity.py')} "
+                f"core@{node['ip']}:/var/tmp/")
+            _vm(node["ip"], "sudo python3 /var/tmp/rewrite-identity.py", identity, check=False)
+        _clone_log(work, "publish clone node IPs while the identity webhook restarts")
+        _publish_clone_addresses(clone_oc, nodes, pairs)
         for node in nodes:
             _vm(node["ip"], "sudo podman rm -f etcd-proxy >/dev/null 2>&1 || true; sudo systemctl stop chrony-wait.service || true; sudo systemctl restart crio", identity, check=False)
             _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
             _vm(node["ip"], "sudo systemctl restart kubelet", identity, check=False)
         _refresh_internal_api_certificate(clone_oc, work, domain, api_vip, nodes, identity)
+        _clone_log(work, "replace node identity and ovnkube pods that still use the source API")
+        env.run(
+            f"{clone_oc} delete pod -n openshift-network-node-identity --all --force --grace-period=0",
+            check=False)
+        env.run(
+            f"{clone_oc} delete pod -n openshift-ovn-kubernetes -l app=ovnkube-node --force --grace-period=0",
+            check=False)
 
     _clone_log(work, "wait for three Ready nodes, an etcd leader, and green operators")
     deadline = time.time() + 40 * 60
     last = None
     last_auth = "unchecked"
     last_domains = "unchecked"
+    webhook_confirmed = False
     while time.time() < deadline:
         for node in nodes:
             _vm(node["ip"],
                 "systemctl is-active --quiet kubelet || sudo systemctl stop chrony-wait.service || true",
                 identity, check=False)
-        nodes_out = env.run(f"{clone_oc} get nodes --no-headers", check=False)
+        nodes_out = env.run(f"{clone_oc} get nodes -o wide --no-headers", check=False)
         co_out = env.run(f"{clone_oc} get co --no-headers", check=False)
+        etcd_pods_out = env.run(
+            f"{clone_oc} get pods -n openshift-etcd -l app=etcd --no-headers", check=False)
+        nni_out = env.run(
+            f"{clone_oc} get ds network-node-identity -n openshift-network-node-identity "
+            "-o jsonpath='{.status.desiredNumberScheduled} {.status.updatedNumberScheduled} {.status.numberReady}'",
+            check=False)
         endpoints = ",".join(f"https://{node['ip']}:2379" for node in nodes)
         etcd_out = _vm(api_ip,
             "sudo podman run --rm --network host --privileged --authfile /var/lib/kubelet/config.json "
@@ -2426,7 +2550,15 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
                 "started": "error" not in item and bool(header.get("member_id")),
                 "leader": header.get("member_id") is not None and header.get("member_id") == body.get("leader"),
             })
-        health = compact_health(parse_oc_nodes(nodes_out.stdout or ""), members, parse_oc_co(co_out.stdout or ""))
+        parsed_nodes = parse_oc_nodes(nodes_out.stdout or "")
+        health = compact_health(parsed_nodes, members, parse_oc_co(co_out.stdout or ""))
+        addresses_ok = compact_node_ips_ready(parsed_nodes, nodes)
+        etcd_pods = parse_etcd_pods(etcd_pods_out.stdout or "")
+        nni_parts = (nni_out.stdout or "").split()
+        nni_ready = (
+            len(nni_parts) == 3 and nni_parts[0] == nni_parts[1] == nni_parts[2]
+            and nni_parts[0] == str(len(COMPACT_ROLES))
+        )
         last = health
         admin_auth = compact_admin_auth_results(clone_kc, nodes)
         admin_failed = [item["role"] for item in admin_auth if not item["ok"]]
@@ -2459,9 +2591,20 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         _clone_log(
             work,
             f"health ready={health['ready']} etcd={health['etcd_started']} leader={health['leader']} "
+            f"etcdpods={etcd_pods} ips={'ok' if addresses_ok else 'stale'} "
             f"unhealthy={','.join(health['unhealthy_operators']) or 'none'} auth={auth_detail} "
             f"{domain_detail}")
-        if operators_ready and auth_ready and domains_ready:
+        clone_ready = operators_ready and auth_ready and domains_ready and addresses_ok and etcd_pods == len(COMPACT_ROLES)
+        if not clone_ready:
+            if webhook_confirmed:
+                _set_node_identity_webhook(clone_oc, "Ignore")
+                webhook_confirmed = False
+        elif not nni_ready:
+            webhook_confirmed = False
+        elif not webhook_confirmed:
+            _set_node_identity_webhook(clone_oc, "Fail")
+            webhook_confirmed = True
+        else:
             if health["unhealthy_operators"] == ["insights"]:
                 _clone_log(
                     work,
@@ -2920,7 +3063,11 @@ def parse_oc_nodes(text):
         parts = line.split()
         if len(parts) < 2 or parts[0] == "NAME":
             continue
-        rows.append({"name": parts[0], "ready": parts[1] == "Ready"})
+        rows.append({
+            "name": parts[0],
+            "ready": parts[1] == "Ready",
+            "ip": parts[5] if len(parts) > 5 else "",
+        })
     return rows
 
 
