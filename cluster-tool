@@ -1596,19 +1596,39 @@ def compact_etcd_cert_names(nodes):
     return names
 
 
+def _decode_secret_value(value):
+    """Decode one Secret data value, or return an empty string when it is not PEM text."""
+    try:
+        return base64.b64decode(value).decode()
+    except (ValueError, UnicodeError):
+        return ""
+
+
+def compact_etcd_secret_delta(secret_raw, pems):
+    """Return bundle keys that are absent or still differ from the generated PEMs."""
+    current = (json.loads(secret_raw).get("data") or {})
+    absent = []
+    changed = []
+    for key, pem in pems.items():
+        if not pem:
+            continue
+        if key not in current:
+            absent.append(key)
+            continue
+        if _decode_secret_value(current[key]) != pem:
+            changed.append(key)
+    return {"absent": absent, "changed": changed}
+
+
 def compact_etcd_secret_patch(secret_raw, pems):
-    """Replace PEM keys that already exist in an etcd secret."""
+    """Replace PEM keys that already exist in an etcd secret and differ."""
     doc = json.loads(secret_raw)
     current = doc.get("data") or {}
     data = {}
     for key, pem in pems.items():
         if key not in current or not pem:
             continue
-        try:
-            existing = base64.b64decode(current[key]).decode()
-        except (ValueError, UnicodeError):
-            existing = ""
-        if existing == pem:
+        if _decode_secret_value(current[key]) == pem:
             continue
         data[key] = base64.b64encode(pem.encode()).decode()
     return json.dumps({"data": data})
@@ -2254,49 +2274,123 @@ def _load_reissued_etcd_pems(work, nodes):
     return pems
 
 
+def _etcd_member_secret_status(clone_oc, secret, pems):
+    """Classify one per-member secret. A missing secret is best-effort; a failed update is not."""
+    raw = env.run(
+        f"{clone_oc} get secret {shlex.quote(secret)} -n openshift-etcd -o json",
+        check=False)
+    text = f"{raw.stdout or ''} {raw.stderr or ''}"
+    if raw.returncode != 0 or not (raw.stdout or "").strip():
+        if raw.returncode != 0 and "not found" in text.lower():
+            return "missing"
+        return "failed"
+    member = {
+        "tls.crt": pems.get(f"{secret}.crt", ""),
+        "tls.key": pems.get(f"{secret}.key", ""),
+    }
+    try:
+        delta = compact_etcd_secret_delta(raw.stdout, member)
+    except json.JSONDecodeError:
+        return "failed"
+    if delta["absent"]:
+        return "failed"
+    if not delta["changed"]:
+        return "current"
+    patch = compact_etcd_secret_patch(raw.stdout, member)
+    patched = env.run(
+        f"{clone_oc} patch secret {shlex.quote(secret)} -n openshift-etcd --type=merge "
+        f"-p {shlex.quote(patch)}",
+        check=False)
+    if patched.returncode != 0:
+        return "failed"
+    checked = env.run(
+        f"{clone_oc} get secret {shlex.quote(secret)} -n openshift-etcd -o json",
+        check=False)
+    if checked.returncode != 0 or not (checked.stdout or "").strip():
+        return "failed"
+    try:
+        confirmed = compact_etcd_secret_delta(checked.stdout, member)
+    except json.JSONDecodeError:
+        return "failed"
+    if confirmed["absent"] or confirmed["changed"]:
+        return "failed"
+    return "patched"
+
+
 def _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes):
-    """Install reissued etcd certificates into the bundle secrets and, when asked, onto the nodes."""
+    """Install reissued etcd certificates into the live bundle and classify per-member secrets.
+
+    The live etcd-all-certs result is patched, already-current, or failed. Missing per-member
+    secrets stay best-effort. A present member secret that cannot be verified is failed.
+    """
+    result = {
+        "bundle": "failed",
+        "detail": "",
+        "members_missing": [],
+        "members_patched": [],
+        "members_current": [],
+        "members_failed": [],
+    }
     pems = _load_reissued_etcd_pems(work, nodes)
     if not pems:
-        return
-    listed = env.run(f"{clone_oc} get secret -n openshift-etcd -o name", check=False)
-    for line in (listed.stdout or "").splitlines():
-        name = line.strip().split("/")[-1]
-        if name != "etcd-all-certs":
-            continue
-        raw = env.run(
-            f"{clone_oc} get secret {shlex.quote(name)} -n openshift-etcd -o json",
-            check=False)
-        if raw.returncode != 0 or not raw.stdout.strip():
-            continue
+        result["detail"] = "no reissued etcd certificates were found"
+        return result
+    raw = env.run(
+        f"{clone_oc} get secret etcd-all-certs -n openshift-etcd -o json",
+        check=False)
+    if raw.returncode != 0 or not (raw.stdout or "").strip():
+        result["detail"] = "reading etcd-all-certs failed"
+        return result
+    try:
+        delta = compact_etcd_secret_delta(raw.stdout, pems)
+    except json.JSONDecodeError:
+        result["detail"] = "etcd-all-certs is not valid JSON"
+        return result
+    if delta["absent"]:
+        result["detail"] = "etcd-all-certs is missing " + ",".join(delta["absent"])
+        return result
+    if delta["changed"]:
         patch = compact_etcd_secret_patch(raw.stdout, pems)
-        if not json.loads(patch)["data"]:
-            continue
-        env.run(
-            f"{clone_oc} patch secret {shlex.quote(name)} -n openshift-etcd --type=merge "
+        _clone_log(work, "etcd-all-certs patch requested")
+        patched = env.run(
+            f"{clone_oc} patch secret etcd-all-certs -n openshift-etcd --type=merge "
             f"-p {shlex.quote(patch)}",
             check=False)
+        if patched.returncode != 0:
+            result["detail"] = "patching etcd-all-certs failed"
+            return result
+        checked = env.run(
+            f"{clone_oc} get secret etcd-all-certs -n openshift-etcd -o json",
+            check=False)
+        if checked.returncode != 0 or not (checked.stdout or "").strip():
+            result["detail"] = "re-reading etcd-all-certs failed"
+            return result
+        try:
+            confirmed = compact_etcd_secret_delta(checked.stdout, pems)
+        except json.JSONDecodeError:
+            result["detail"] = "etcd-all-certs is not valid JSON after the patch"
+            return result
+        if confirmed["absent"] or confirmed["changed"]:
+            result["detail"] = "etcd-all-certs did not match the generated certificates after the patch"
+            return result
+        _clone_log(work, "etcd-all-certs patch verified")
+        result["bundle"] = "patched"
+    else:
+        _clone_log(work, "etcd-all-certs already-current")
+        result["bundle"] = "already-current"
     for node in nodes:
         for kind in ("peer", "serving", "serving-metrics"):
             secret = f"etcd-{kind}-{node['role']}"
-            raw = env.run(
-                f"{clone_oc} get secret {shlex.quote(secret)} -n openshift-etcd -o json",
-                check=False)
-            if raw.returncode != 0 or not raw.stdout.strip():
-                continue
-            member = {
-                "tls.crt": pems.get(f"{secret}.crt", ""),
-                "tls.key": pems.get(f"{secret}.key", ""),
-            }
-            patch = compact_etcd_secret_patch(raw.stdout, member)
-            if not json.loads(patch)["data"]:
-                continue
-            env.run(
-                f"{clone_oc} patch secret {shlex.quote(secret)} -n openshift-etcd --type=merge "
-                f"-p {shlex.quote(patch)}",
-                check=False)
+            status = _etcd_member_secret_status(clone_oc, secret, pems)
+            bucket = {
+                "missing": "members_missing",
+                "failed": "members_failed",
+                "current": "members_current",
+                "patched": "members_patched",
+            }[status]
+            result[bucket].append(secret)
     if not copy_to_nodes:
-        return
+        return result
     for node in nodes:
         for other in nodes:
             env.run(
@@ -2305,6 +2399,25 @@ def _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes):
                 f"{shlex.quote(work + '/etcd-new')}/etcd-*-{other['role']}.key "
                 f"core@{node['ip']}:/var/tmp/")
         _vm(node["ip"], compact_install_etcd_certs_script(), identity, check=False)
+    return result
+
+
+def _require_reissued_etcd_certs(clone_oc, nodes, identity, work):
+    """Update the live etcd bundle and abort unless the result is patched or already-current."""
+    result = _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes=False)
+    status = "failed" if result["members_failed"] else result["bundle"]
+    missing = ",".join(result["members_missing"]) or "none"
+    failed_members = ",".join(result["members_failed"]) or "none"
+    detail = f" ({result['detail']})" if result["detail"] else ""
+    _clone_log(
+        work,
+        f"etcd certificate inputs {status}{detail}; "
+        f"members missing={missing} failed={failed_members}")
+    if status not in ("patched", "already-current"):
+        sys.exit(
+            f"etcd certificate inputs {status}{detail}. "
+            f"Log: {work}/clone.log")
+    return result
 
 
 def _set_node_identity_webhook(clone_oc, policy):
@@ -2446,8 +2559,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         _vm(recert_node["ip"], compact_start_recert_node_script(), identity, check=False)
         _wait_admin_auth(src_kc, recert_node)
         early_oc = _oc(src_kc, f"https://{api_ip}:6443")
-        _clone_log(work, "etcd certificate inputs updated; the operator rollout overlaps the rest of the heal")
-        _sync_reissued_etcd_certs(early_oc, nodes, identity, work, copy_to_nodes=False)
+        _require_reissued_etcd_certs(early_oc, nodes, identity, work)
         _sync_requestheader_aggregator_ca(src_kc, api_ip, work, identity, quorum["ip"])
 
         _clone_log(work, "sign kubelet certificates with the live CSR signer")
@@ -2491,8 +2603,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
     clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
     if start_at == "rewrite":
-        _clone_log(work, "etcd certificate inputs updated; the operator rollout overlaps the rest of the heal")
-        _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes=False)
+        _require_reissued_etcd_certs(clone_oc, nodes, identity, work)
     if start_at != "health":
         _clone_log(work, "rewrite cluster records and 00-master")
         domain = f"test-infra-cluster-{clone_id}.redhat.com"
@@ -2629,6 +2740,7 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
     last_domains = "unchecked"
     webhook_confirmed = False
     stable_samples = 0
+    last_etcd_sample = None
     while time.time() < deadline:
         for node in nodes:
             _vm(node["ip"],
@@ -2701,11 +2813,17 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             f"ingress={domains['apps_domain'] or 'missing'}"
         )
         last_domains = domain_detail
-        if stage != "core-ready" or not auth_ready or not domains_ready:
-            stable_samples = 0
+        etcd_sample = (health["etcd_started"], etcd_pods, bool(health["leader"]), "etcd" in core_unhealthy)
+        if etcd_sample != last_etcd_sample:
+            _clone_log(
+                work,
+                f"etcd rollout started={health['etcd_started']} pods={etcd_pods} "
+                f"leader={health['leader']} progressing={'etcd' in core_unhealthy}")
+            last_etcd_sample = etcd_sample
+        stable_samples = compact_next_stable_samples(stable_samples, stage, auth_ready, domains_ready)
+        if stable_samples == 0:
             reported_stage = stage if stage != "core-ready" else "core"
         else:
-            stable_samples += 1
             reported_stage = "ready" if not post_unhealthy else "post-boot"
         _clone_log(
             work,
@@ -3225,6 +3343,13 @@ def compact_readiness_stage(ready, addresses_ok, etcd_started, etcd_pods, leader
     if core_unhealthy:
         return "core"
     return "core-ready"
+
+
+def compact_next_stable_samples(stable_samples, stage, auth_ready, domains_ready):
+    """Advance the core stability count, or reset it when a core condition regresses."""
+    if stage != "core-ready" or not auth_ready or not domains_ready:
+        return 0
+    return stable_samples + 1
 
 
 def compact_health(nodes, etcd_members, operators):

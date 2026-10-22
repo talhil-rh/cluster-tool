@@ -3,6 +3,7 @@ import argparse
 import base64
 import importlib.machinery
 import importlib.util
+import inspect
 import json
 import os
 import shlex
@@ -1670,6 +1671,161 @@ class TestCompactInspect(unittest.TestCase):
             "etcd-master-0-0 5/5 Running 0 1m\n"
             "etcd-master-0-1 0/5 Pending 0 1m\n"
             "etcd-guard-master-0-0 1/1 Running 0 1m\n"), 1)
+
+    def test_etcd_bundle_update_is_ordered_and_fail_closed(self):
+        source = inspect.getsource(ct._finish_compact_clone)
+        sign = source.index("sign kubelet certificates with the live CSR signer")
+        rewrite = source.index("rewrite cluster records and 00-master")
+        health = source.index("wait for core operators; etcd must stay up for two samples")
+        requires = []
+        start = 0
+        while True:
+            found = source.find("_require_reissued_etcd_certs(", start)
+            if found < 0:
+                break
+            requires.append(found)
+            start = found + 1
+        self.assertEqual(requires, sorted(requires))
+        self.assertEqual(len(requires), 2)
+        self.assertLess(requires[0], sign)
+        self.assertLess(sign, rewrite)
+        self.assertLess(requires[1], rewrite)
+        self.assertLess(rewrite, health)
+        self.assertNotIn("_sync_reissued_etcd_certs(", source)
+        self.assertNotIn("copy_to_nodes=True", source)
+        self.assertNotIn("over the operator revision", source)
+
+        nodes = [{"role": "master-0-0", "ip": "192.168.210.69"}]
+        pems = {
+            f"{name}.{ext}": f"{name}-{ext}\n"
+            for name in ct.compact_etcd_cert_names(nodes)
+            for ext in ("crt", "key")
+        }
+
+        class _Cmd:
+            def __init__(self, returncode=0, stdout="", stderr=""):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        class _Env:
+            def __init__(self, handler):
+                self.calls = []
+                self.handler = handler
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                return self.handler(cmd)
+
+        def bundle(values):
+            return json.dumps({"data": {
+                key: base64.b64encode(value.encode()).decode() for key, value in values.items()
+            }})
+
+        def patches(calls):
+            return [cmd for cmd in calls if "patch secret " in cmd]
+
+        previous = ct.env
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                root = Path(work) / "etcd-new"
+                root.mkdir()
+                for key, value in pems.items():
+                    (root / key).write_text(value)
+                def current_handler(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        return _Cmd(0, bundle(pems))
+                    for name in ct.compact_etcd_cert_names(nodes):
+                        if f"get secret {name} " in cmd:
+                            return _Cmd(0, bundle({
+                                "tls.crt": pems[f"{name}.crt"],
+                                "tls.key": pems[f"{name}.key"],
+                            }))
+                    return _Cmd()
+
+                current = _Env(current_handler)
+                ct.env = current
+                result = ct._sync_reissued_etcd_certs("oc", nodes, "/id", work, False)
+                self.assertEqual(result["bundle"], "already-current")
+                self.assertEqual(result["members_current"], [
+                    "etcd-peer-master-0-0",
+                    "etcd-serving-master-0-0",
+                    "etcd-serving-metrics-master-0-0",
+                ])
+                self.assertEqual(patches(current.calls), [])
+
+                old = {key: "old\n" for key in pems}
+                reads = {"n": 0}
+
+                def changed(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        reads["n"] += 1
+                        return _Cmd(0, bundle(pems if reads["n"] > 1 else old))
+                    if "get secret etcd-" in cmd:
+                        return _Cmd(1, "", "Error from server (NotFound): secret not found")
+                    return _Cmd()
+
+                updated = _Env(changed)
+                ct.env = updated
+                result = ct._sync_reissued_etcd_certs("oc", nodes, "/id", work, False)
+                self.assertEqual(result["bundle"], "patched")
+                self.assertEqual(result["members_missing"], [
+                    "etcd-peer-master-0-0",
+                    "etcd-serving-master-0-0",
+                    "etcd-serving-metrics-master-0-0",
+                ])
+                self.assertEqual(len(patches(updated.calls)), 1)
+                self.assertTrue(any("etcd-all-certs patch requested" in cmd for cmd in updated.calls))
+                self.assertTrue(any("etcd-all-certs patch verified" in cmd for cmd in updated.calls))
+
+                def rejected(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        return _Cmd(1, "", "connection refused")
+                    if "echo yes" in cmd:
+                        return _Cmd(0, "yes\n")
+                    return _Cmd()
+
+                failed = _Env(rejected)
+                ct.env = failed
+                with self.assertRaises(SystemExit) as aborted:
+                    ct._finish_compact_clone(
+                        {}, "edge10", nodes, "/id", work, "/crypto", "etcd", "cn",
+                        "/plan", {}, "192.168.210.81", "/src", [], start_at="rewrite")
+                self.assertIn("reading etcd-all-certs failed", str(aborted.exception))
+                self.assertFalse(any("rewrite cluster records" in cmd for cmd in failed.calls))
+                self.assertFalse(any("wait for core operators" in cmd for cmd in failed.calls))
+                self.assertEqual(patches(failed.calls), [])
+
+                def patch_fails(cmd):
+                    if "get secret etcd-all-certs" in cmd:
+                        return _Cmd(0, bundle(old))
+                    if "patch secret etcd-all-certs" in cmd:
+                        return _Cmd(1, "", "denied")
+                    return _Cmd()
+
+                denied = _Env(patch_fails)
+                ct.env = denied
+                with self.assertRaises(SystemExit) as aborted:
+                    ct._require_reissued_etcd_certs("oc", nodes, "/id", work)
+                self.assertIn("patching etcd-all-certs failed", str(aborted.exception))
+                self.assertFalse(any("patch verified" in cmd for cmd in denied.calls))
+                self.assertFalse(any("wait for core operators" in cmd for cmd in denied.calls))
+        finally:
+            ct.env = previous
+
+    def test_core_ready_resets_when_a_core_condition_regresses(self):
+        for name in ct.CORE_OPERATORS:
+            stage = ct.compact_readiness_stage(3, True, 3, 3, True, [name])
+            self.assertNotEqual(stage, "core-ready", name)
+        core, post = ct.compact_split_operators(["machine-config", "insights"])
+        self.assertEqual(core, [])
+        self.assertEqual(post, ["machine-config"])
+        self.assertEqual(ct.compact_readiness_stage(3, True, 3, 3, True, core), "core-ready")
+        self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", True, True), 2)
+        self.assertEqual(ct.compact_next_stable_samples(1, "etcd-rollout", True, True), 0)
+        self.assertEqual(ct.compact_next_stable_samples(1, "core", True, True), 0)
+        self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", False, True), 0)
+        self.assertEqual(ct.compact_next_stable_samples(1, "core-ready", True, False), 0)
 
     def test_compact_boot_refuses_before_the_sno_path(self):
         class _State:
