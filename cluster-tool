@@ -1853,6 +1853,11 @@ def compact_start_recert_node_script():
         """)
 
 
+def compact_cert_controller_lease():
+    """Return the leader lease that blocks a restarted API cert controller."""
+    return "openshift-kube-apiserver", "cert-regeneration-controller-lock"
+
+
 def compact_restart_cert_controller_command():
     # The cert controller reads the internal API name once, when its process
     # starts. A later crio restart does not replace that process, so it keeps
@@ -1940,10 +1945,8 @@ def _ensure_api_certificates(oc, work, domain, api_ip, nodes, identity):
         "internal-loadbalancer-serving-certkey": f"api-int.{domain}",
         "external-loadbalancer-serving-certkey": f"api.{domain}",
     }
-    for _ in range(6):
-        if all(wanted[name] in _secret_hostnames(oc, name) for name in wanted):
-            break
-        time.sleep(10)
+    # The running controller still has the source API name cached, so waiting
+    # for it to notice the clone name only delays the manual signature.
     if not all(wanted[name] in _secret_hostnames(oc, name) for name in wanted):
         _clone_log(work, "signing API serving certificates with the load balancer signer")
         signer = f"{work}/lb-signer"
@@ -1971,8 +1974,15 @@ def _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity)
     _clone_log(work, "restart the API cert controller so it re-reads the clone API name")
     for node in nodes:
         _vm(node["ip"], compact_restart_cert_controller_command(), identity, check=False)
+    namespace, lease = compact_cert_controller_lease()
+    released = env.run(
+        f"{oc} delete lease {shlex.quote(lease)} -n {shlex.quote(namespace)} --ignore-not-found",
+        check=False)
+    if released.returncode == 0:
+        _clone_log(work, "released the cert controller lease")
+    else:
+        _clone_log(work, "cert controller lease was not deleted; leader election waits for the old lease")
     matched = False
-    # Leader election can take the full lease before the new process reads infrastructure.
     for _ in range(48):
         if hostname in _secret_hostnames(oc, "internal-loadbalancer-serving-certkey"):
             matched = True

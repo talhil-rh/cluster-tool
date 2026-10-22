@@ -1516,6 +1516,18 @@ class TestCompactInspect(unittest.TestCase):
         self.assertEqual(updated["spec"]["template"]["spec"]["containers"][0]["args"], ["https://192.168.200.81:2379"])
         self.assertNotIn("status", updated)
         self.assertIn("kube-apiserver-cert-regeneration-controller", ct.compact_restart_cert_controller_command())
+        self.assertEqual(
+            ct.compact_cert_controller_lease(),
+            ("openshift-kube-apiserver", "cert-regeneration-controller-lock"))
+        refresh = inspect.getsource(ct._refresh_internal_api_certificate)
+        stopped = refresh.index("compact_restart_cert_controller_command")
+        released = refresh.index("compact_cert_controller_lease")
+        waited = refresh.index("_secret_hostnames")
+        self.assertLess(stopped, released)
+        self.assertLess(released, waited)
+        ensure = inspect.getsource(ct._ensure_api_certificates)
+        self.assertLess(ensure.index("_secret_hostnames"), ensure.index("signing API serving certificates"))
+        self.assertNotIn("time.sleep(10)", ensure)
         self.assertTrue(ct.presented_san_matches(
             "DNS:api-int.test-infra-cluster-aabbccdd.redhat.com, IP Address:192.168.200.5",
             "api-int.test-infra-cluster-aabbccdd.redhat.com"))
