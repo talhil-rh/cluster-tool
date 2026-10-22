@@ -9,6 +9,7 @@ import os
 import shlex
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1846,6 +1847,12 @@ class TestCompactInspect(unittest.TestCase):
                     if "patch etcd cluster" in cmd:
                         self.assertIn("forceRedeploymentReason", cmd)
                         return _Cmd()
+                    if "get co etcd -o json" in cmd:
+                        return _Cmd(0, json.dumps({"status": {"conditions": [{
+                            "type": "Progressing",
+                            "status": "False",
+                            "message": "NodeInstallerProgressing: 3 nodes are at revision 10",
+                        }]}}))
                     return _Cmd()
 
                 triggered = _Env(trigger_handler)
@@ -1872,6 +1879,12 @@ class TestCompactInspect(unittest.TestCase):
                         return _Cmd()
                     if "patch etcd cluster" in cmd:
                         return _Cmd(1, "", "denied")
+                    if "get co etcd -o json" in cmd:
+                        return _Cmd(0, json.dumps({"status": {"conditions": [{
+                            "type": "Progressing",
+                            "status": "False",
+                            "message": "NodeInstallerProgressing: 3 nodes are at revision 10",
+                        }]}}))
                     if "get secret etcd-" in cmd:
                         return _Cmd(1, "", "Error from server (NotFound): secret not found")
                     return _Cmd()
@@ -1921,7 +1934,7 @@ class TestCompactInspect(unittest.TestCase):
             },
         }
         self.assertTrue(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), 10))
-        self.assertTrue(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), None))
+        self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), None))
         self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(quiet), 12))
         self.assertFalse(ct.compact_static_pod_rollout_ready(ct.compact_static_pod_revision(pending), 10))
         settled = {"status": {"conditions": [
@@ -1946,6 +1959,126 @@ class TestCompactInspect(unittest.TestCase):
         self.assertFalse(ct.compact_static_pod_revision(rolling)["converged"])
         self.assertFalse(ct.compact_static_pod_revision(split)["converged"])
         self.assertEqual(ct.compact_static_pod_revision(split)["latest"], 8)
+
+    def test_edge13_revision_messages_need_exactly_three_nodes(self):
+        quiet = (
+            "NodeInstallerProgressing: 3 nodes are at revision 13\n"
+            "StaticPodsAvailable: 3 nodes are active; 3 nodes are at revision 13"
+        )
+        rolling = (
+            "NodeInstallerProgressing: 3 nodes are at revision 9; "
+            "0 nodes have achieved new revision 10\n"
+            "StaticPodsAvailable: 3 nodes are active; 3 nodes are at revision 9; "
+            "0 nodes have achieved new revision 10"
+        )
+        singular = "NodeInstallerProgressing: 1 node is at revision 5; 2 nodes are at revision 8"
+        contradictory = "NodeInstallerProgressing: 3 nodes are at revision 10; 1 node is at revision 12"
+        short = "NodeInstallerProgressing: 2 nodes are at revision 10; 2 nodes are at revision 11"
+        malformed = "NodeInstallerProgressing: all nodes are current"
+        self.assertEqual(ct.compact_revision_from_text(quiet), {
+            "latest": 13, "current": 13, "converged": True,
+        })
+        self.assertEqual(ct.compact_revision_from_text(rolling), {
+            "latest": 10, "current": 9, "converged": False,
+        })
+        self.assertFalse(ct.compact_revision_from_text(singular)["converged"])
+        self.assertEqual(ct.compact_revision_from_text(singular)["latest"], 8)
+        self.assertIsNone(ct.compact_revision_from_text(singular)["current"])
+        self.assertFalse(ct.compact_revision_from_text(contradictory)["converged"])
+        self.assertIsNone(ct.compact_revision_from_text(contradictory)["current"])
+        self.assertFalse(ct.compact_revision_from_text(short)["converged"])
+        self.assertEqual(ct.compact_revision_from_text(short)["latest"], 11)
+        self.assertEqual(ct.compact_revision_from_text(malformed), {
+            "latest": None, "current": None, "converged": False,
+        })
+        self.assertEqual(ct.compact_revision_from_text(""), {
+            "latest": None, "current": None, "converged": False,
+        })
+        duplicated = {"status": {"conditions": [
+            {"type": "Progressing", "status": "False",
+             "message": "NodeInstallerProgressing: 3 nodes are at revision 13"},
+            {"type": "Available", "status": "True",
+             "message": "StaticPodsAvailable: 3 nodes are active; 3 nodes are at revision 13"},
+        ]}}
+        self.assertTrue(ct.compact_static_pod_revision(duplicated)["converged"])
+        self.assertEqual(ct.compact_static_pod_revision(duplicated)["latest"], 13)
+        split_message = (
+            "NodeInstallerProgressing: 1 node is at revision 10; 2 nodes are at revision 12"
+        )
+        self.assertFalse(ct.compact_revision_from_text(split_message)["converged"])
+        self.assertEqual(ct.compact_revision_from_text(
+            "NodeInstallerProgressing: 2 nodes are at revision 5; 1 node is at revision 8"
+        )["latest"], 8)
+        self.assertEqual(ct.compact_revision_from_text(
+            "NodeInstallerProgressing: 3 nodes are at revision 10; 0 nodes have achieved new revision 12"
+        ), {"latest": 12, "current": 10, "converged": False})
+
+    def test_health_resume_requires_saved_revision_baselines(self):
+        self.assertIsNone(ct.compact_valid_revision_baselines(None))
+        self.assertIsNone(ct.compact_valid_revision_baselines({"etcd": 10}))
+        self.assertIsNone(ct.compact_valid_revision_baselines({"etcd": 10, "kube-apiserver": None}))
+        self.assertIsNone(ct.compact_valid_revision_baselines({"etcd": True, "kube-apiserver": 5}))
+        self.assertEqual(
+            ct.compact_valid_revision_baselines({"etcd": 10, "kube-apiserver": 5}),
+            (10, 5))
+
+        class _Cmd:
+            def __init__(self, stdout=""):
+                self.returncode = 0
+                self.stdout = stdout
+                self.stderr = ""
+
+        class _Env:
+            def __init__(self, stdout=""):
+                self.calls = []
+                self.stdout = stdout
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                return _Cmd(self.stdout)
+
+        previous = ct.env
+        try:
+            missing = _Env("")
+            ct.env = missing
+            self.assertIsNone(ct._load_revision_baselines("/work"))
+            with self.assertRaises(SystemExit) as aborted:
+                ct._finish_compact_clone(
+                    {}, "edge14", [], "/id", "/work", "/crypto", "etcd", "cn",
+                    "/plan", {}, "192.168.214.81", "/src", [], start_at="health")
+            self.assertIn("revision baselines", str(aborted.exception))
+            self.assertFalse(any("wait until etcd and the API revisions" in cmd for cmd in missing.calls))
+            saved = _Env(json.dumps({"etcd": 10, "kube-apiserver": 5}))
+            ct.env = saved
+            self.assertEqual(ct._load_revision_baselines("/work"), (10, 5))
+        finally:
+            ct.env = previous
+
+    def test_parallel_failures_are_reported_in_node_order(self):
+        nodes = [
+            {"role": "master-0-2", "ip": "192.168.214.89"},
+            {"role": "master-0-0", "ip": "192.168.214.69"},
+            {"role": "master-0-1", "ip": "192.168.214.81"},
+        ]
+
+        def fail(node):
+            if node["role"] != "master-0-1":
+                sys.exit(f"boom {node['role']}")
+
+        with self.assertRaises(SystemExit) as aborted:
+            ct._in_parallel(nodes, fail)
+        text = str(aborted.exception)
+        self.assertLess(text.index("master-0-2"), text.index("master-0-0"))
+        self.assertNotIn("master-0-1", text)
+        self.assertIn("boom master-0-2", text)
+        self.assertIn("boom master-0-0", text)
+        with self.assertRaises(SystemExit) as aborted:
+            ct._in_parallel([
+                ({"role": "master-0-1"}, "restore"),
+                ({"role": "master-0-0"}, "restore"),
+            ], lambda item: sys.exit("restore failed"))
+        text = str(aborted.exception)
+        self.assertLess(text.index("master-0-1"), text.index("master-0-0"))
         blocker = ct.compact_core_blocker_text(json.dumps({"items": [{
             "metadata": {"name": "kube-apiserver"},
             "status": {"conditions": [

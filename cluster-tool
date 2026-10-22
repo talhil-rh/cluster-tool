@@ -12,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import urllib.parse
 from contextlib import contextmanager
@@ -2122,22 +2123,34 @@ def _wait_ssh(ip, identity, attempts=60):
     sys.exit(f"SSH to {ip} did not come up")
 
 
+def _parallel_label(item):
+    """Return the node role for a parallel work item."""
+    if isinstance(item, dict) and item.get("role"):
+        return item["role"]
+    if isinstance(item, tuple) and item and isinstance(item[0], dict) and item[0].get("role"):
+        return item[0]["role"]
+    return str(item)
+
+
 def _in_parallel(items, fn):
     """Run one independent action per item at the same time."""
     if not items:
         return
-    errors = []
+    errors = {}
+    lock = threading.Lock()
 
-    def invoke(item):
+    def invoke(indexed):
+        index, item = indexed
         try:
             fn(item)
         except SystemExit as exc:
-            errors.append(str(exc) or "parallel step failed")
+            with lock:
+                errors[index] = f"{_parallel_label(item)}: {exc or 'parallel step failed'}"
 
     with ThreadPoolExecutor(max_workers=len(items)) as pool:
-        list(pool.map(invoke, items))
+        list(pool.map(invoke, enumerate(items)))
     if errors:
-        sys.exit(errors[0])
+        sys.exit("parallel step failed: " + "; ".join(errors[index] for index in sorted(errors)))
 
 
 def _oc(kubeconfig, server):
@@ -2456,6 +2469,55 @@ def _require_reissued_etcd_certs(clone_oc, nodes, identity, work):
     return result
 
 
+def _revision_int(value):
+    """Return whether a revision number is a real integer."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def compact_valid_revision_baselines(payload):
+    """Return saved etcd and kube-apiserver baselines, or None when either is missing."""
+    if not isinstance(payload, dict):
+        return None
+    etcd = payload.get("etcd")
+    apiserver = payload.get("kube-apiserver")
+    if not _revision_int(etcd) or not _revision_int(apiserver):
+        return None
+    return (etcd, apiserver)
+
+
+def _revision_baselines_path(work):
+    """Return the path of the persisted pre-rollout revision baselines."""
+    return work + "/revision-baselines.json"
+
+
+def _load_revision_baselines(work):
+    """Load both pre-rollout revision baselines. Missing or partial data is unusable."""
+    raw = env.run(
+        f"cat {shlex.quote(_revision_baselines_path(work))} 2>/dev/null || true",
+        check=False)
+    try:
+        payload = json.loads(raw.stdout or "")
+    except json.JSONDecodeError:
+        payload = None
+    return compact_valid_revision_baselines(payload)
+
+
+def _store_revision_baseline(work, name, value):
+    """Persist one pre-rollout revision without dropping the other."""
+    if not _revision_int(value):
+        return
+    path = _revision_baselines_path(work)
+    raw = env.run(f"cat {shlex.quote(path)} 2>/dev/null || true", check=False)
+    try:
+        loaded = json.loads(raw.stdout or "")
+    except json.JSONDecodeError:
+        loaded = None
+    payload = dict(loaded) if isinstance(loaded, dict) else {}
+    payload[name] = value
+    env.write_file(path, json.dumps(payload) + "\n")
+    env.run(f"chmod 600 {shlex.quote(path)}")
+
+
 def _operator_latest_revision(clone_oc, name):
     """Read the revision currently installed for one static-pod operator."""
     raw = env.run(f"{clone_oc} get co {shlex.quote(name)} -o json", check=False)
@@ -2471,6 +2533,10 @@ def _operator_latest_revision(clone_oc, name):
 def _trigger_etcd_member_rollout(clone_oc, work):
     """Start the operator-controlled etcd rollout after the live bundle is verified."""
     baseline = _operator_latest_revision(clone_oc, "etcd")
+    if not _revision_int(baseline):
+        sys.exit(
+            "etcd revision baseline is unavailable; refusing to start the member rollout. "
+            f"Log: {work}/clone.log")
     reason = "reissued-etcd-certs-" + datetime.now().strftime("%Y%m%dT%H%M%S")
     patch = json.dumps(compact_etcd_force_redeploy_patch(reason))
     patched = env.run(
@@ -2535,7 +2601,16 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
     etcd_revision_baseline = None
     apiserver_revision_baseline = None
     if start_at == "health":
-        _clone_log(work, "resume at the health check")
+        loaded = _load_revision_baselines(work)
+        if loaded is None:
+            sys.exit(
+                "Refusing to resume the health check without saved etcd and "
+                f"kube-apiserver revision baselines. Log: {work}/clone.log")
+        etcd_revision_baseline, apiserver_revision_baseline = loaded
+        _clone_log(
+            work,
+            "resume at the health check from etcd revision "
+            f"{etcd_revision_baseline} and kube-apiserver revision {apiserver_revision_baseline}")
     elif start_at == "rewrite":
         _clone_log(work, "resume after the Recert commit; rewriting cluster records")
     else:
@@ -2624,8 +2699,9 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         _wait_admin_auth(src_kc, recert_node)
         early_oc = _oc(src_kc, f"https://{api_ip}:6443")
         certs = _require_reissued_etcd_certs(early_oc, nodes, identity, work)
-        if certs.get("etcd_revision_baseline") is not None:
+        if _revision_int(certs.get("etcd_revision_baseline")):
             etcd_revision_baseline = certs["etcd_revision_baseline"]
+            _store_revision_baseline(work, "etcd", etcd_revision_baseline)
         _sync_requestheader_aggregator_ca(src_kc, api_ip, work, identity, quorum["ip"])
 
         _clone_log(work, "sign kubelet certificates with the live CSR signer")
@@ -2670,8 +2746,9 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
     clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
     if start_at == "rewrite":
         certs = _require_reissued_etcd_certs(clone_oc, nodes, identity, work)
-        if certs.get("etcd_revision_baseline") is not None:
+        if _revision_int(certs.get("etcd_revision_baseline")):
             etcd_revision_baseline = certs["etcd_revision_baseline"]
+            _store_revision_baseline(work, "etcd", etcd_revision_baseline)
     if start_at != "health":
         _clone_log(work, "rewrite cluster records and 00-master")
         domain = f"test-infra-cluster-{clone_id}.redhat.com"
@@ -2798,6 +2875,11 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
 
         _in_parallel(nodes, refresh_node_address)
         apiserver_revision_baseline = _operator_latest_revision(clone_oc, "kube-apiserver")
+        if not _revision_int(apiserver_revision_baseline):
+            sys.exit(
+                "kube-apiserver revision baseline is unavailable; refusing to continue "
+                f"without the pre-refresh revision. Log: {work}/clone.log")
+        _store_revision_baseline(work, "kube-apiserver", apiserver_revision_baseline)
         _clone_log(work, f"kube-apiserver revision baseline {apiserver_revision_baseline}")
         _refresh_internal_api_certificate(clone_oc, work, domain, api_vip, nodes, identity)
         _clone_log(work, "replace node identity and ovnkube pods that still use the source API")
@@ -2808,6 +2890,11 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             f"{clone_oc} delete pod -n openshift-ovn-kubernetes -l app=ovnkube-node --force --grace-period=0",
             check=False)
 
+    if not _revision_int(etcd_revision_baseline) or not _revision_int(apiserver_revision_baseline):
+        sys.exit(
+            "Refusing to wait for install revisions without an etcd baseline "
+            f"({etcd_revision_baseline}) and a kube-apiserver baseline "
+            f"({apiserver_revision_baseline}). Log: {work}/clone.log")
     _clone_log(work, "wait until etcd and the API revisions are installed for vmaas")
     deadline = time.time() + 40 * 60
     last = None
@@ -3474,36 +3561,33 @@ def compact_operator_docs(raw):
 def compact_revision_from_text(text):
     """Read a static-pod revision from a ClusterOperator condition message.
 
-    OpenShift 4.22 reports the revision only in that message, for example
-    "3 nodes are at revision 13" or "3 nodes are at revision 10; 0 nodes have
-    achieved new revision 12".
+    OpenShift 4.22 reports the revision only in that message. Identical sentences
+    repeated by Progressing and Available count once. Settled means exactly one
+    revision has exactly three nodes and no higher revision is still pending.
     """
-    at_revision = []
+    totals = {}
     pending = []
+    seen = set()
     for match in re.finditer(
         r"(\d+) nodes? (are at revision|is at revision|have achieved new revision) (\d+)",
         text or "",
         re.I,
     ):
         count, kind, revision = int(match.group(1)), match.group(2).lower(), int(match.group(3))
-        if "achieved" in kind:
-            if count == 0:
-                pending.append(revision)
-            else:
-                at_revision.append((count, revision))
-        else:
-            at_revision.append((count, revision))
-    if not at_revision and not pending:
-        return {"latest": None, "current": None, "converged": False}
-    current = max(at_revision, key=lambda item: item[0])[1] if at_revision else None
-    revisions = {revision for _, revision in at_revision}
-    settled = (
-        not pending
-        and len(revisions) == 1
-        and max(count for count, _ in at_revision) >= len(COMPACT_ROLES)
-    )
-    mentioned = [revision for _, revision in at_revision] + pending
-    latest = current if settled else max(mentioned)
+        token = (count, kind, revision)
+        if token in seen:
+            continue
+        seen.add(token)
+        if "achieved" in kind and count == 0:
+            pending.append(revision)
+            continue
+        totals[revision] = totals.get(revision, 0) + count
+    positive = {revision: count for revision, count in totals.items() if count > 0}
+    only = next(iter(positive)) if len(positive) == 1 else None
+    current = only if only is not None and positive[only] == len(COMPACT_ROLES) else None
+    settled = current is not None and not pending
+    mentioned = list(positive) + pending
+    latest = current if settled else (max(mentioned) if mentioned else None)
     return {"latest": latest, "current": current, "converged": settled}
 
 
@@ -3527,10 +3611,10 @@ def compact_static_pod_revision(operator_doc):
 
 
 def compact_static_pod_rollout_ready(revision, baseline):
-    """Require every node on the latest revision, and a newer revision after a requested rollout."""
-    if not revision or not revision.get("converged") or not isinstance(revision.get("latest"), int):
+    """Require every node on a revision newer than the saved pre-rollout baseline."""
+    if not revision or not revision.get("converged") or not _revision_int(revision.get("latest")):
         return False
-    if isinstance(baseline, int) and revision["latest"] <= baseline:
+    if not _revision_int(baseline) or revision["latest"] <= baseline:
         return False
     return True
 
