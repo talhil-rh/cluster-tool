@@ -1652,10 +1652,20 @@ class TestCompactInspect(unittest.TestCase):
         self.assertEqual(base64.b64decode(patched["data"]["etcd-peer-master-0-2.crt"]).decode(), "new-cert")
         self.assertNotIn("etcd-peer-master-0-2.key", patched["data"])
         self.assertNotIn("missing.crt", patched["data"])
+        unchanged = json.loads(ct.compact_etcd_secret_patch(secret, {
+            "etcd-peer-master-0-2.crt": "old",
+        }))
+        self.assertEqual(unchanged["data"], {})
         self.assertIn("etcd-peer-master-0-2", ct.compact_etcd_cert_names([
             {"role": "master-0-2"},
         ]))
         self.assertIn("find /etc/kubernetes/static-pod-resources", ct.compact_install_etcd_certs_script())
+        self.assertEqual(ct.compact_readiness_stage(3, True, 2, 2, True, ["etcd"]), "etcd-rollout")
+        self.assertEqual(ct.compact_readiness_stage(3, True, 3, 3, True, ["kube-apiserver"]), "core")
+        self.assertEqual(ct.compact_readiness_stage(3, True, 3, 3, True, []), "core-ready")
+        core, post = ct.compact_split_operators(["etcd", "console", "insights"])
+        self.assertEqual(core, ["etcd"])
+        self.assertEqual(post, ["console"])
         self.assertEqual(ct.parse_etcd_pods(
             "etcd-master-0-0 5/5 Running 0 1m\n"
             "etcd-master-0-1 0/5 Pending 0 1m\n"

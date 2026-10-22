@@ -1602,8 +1602,15 @@ def compact_etcd_secret_patch(secret_raw, pems):
     current = doc.get("data") or {}
     data = {}
     for key, pem in pems.items():
-        if key in current and pem:
-            data[key] = base64.b64encode(pem.encode()).decode()
+        if key not in current or not pem:
+            continue
+        try:
+            existing = base64.b64decode(current[key]).decode()
+        except (ValueError, UnicodeError):
+            existing = ""
+        if existing == pem:
+            continue
+        data[key] = base64.b64encode(pem.encode()).decode()
     return json.dumps({"data": data})
 
 
@@ -1951,16 +1958,17 @@ def _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity)
             f"The API cert controller did not issue a certificate for {hostname}. "
             f"Kubelet cannot trust the API, so the network rollout cannot finish. "
             f"Log: {work}/clone.log")
-    for _ in range(8):
+    _clone_log(work, "API certificate secret has the clone name")
+    for attempt in range(3):
         if presented_san_matches(_presented_san(api_ip, hostname), hostname):
             _clone_log(work, "API certificate presents the clone name")
             return
-        for node in nodes:
-            _vm(node["ip"], compact_reload_apiserver_script(), identity, check=False)
-        time.sleep(10)
+        if attempt == 0:
+            for node in nodes:
+                _vm(node["ip"], compact_reload_apiserver_script(), identity, check=False)
+        time.sleep(5)
     sys.exit(
-        f"The apiserver is not presenting a certificate for {hostname}. "
-        f"Kubelet cannot trust the API, so the network rollout cannot finish. "
+        f"The API certificate for {hostname} was issued but the apiserver is not presenting it. "
         f"Log: {work}/clone.log")
 
 
@@ -2254,7 +2262,7 @@ def _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes):
     listed = env.run(f"{clone_oc} get secret -n openshift-etcd -o name", check=False)
     for line in (listed.stdout or "").splitlines():
         name = line.strip().split("/")[-1]
-        if not name.startswith("etcd-all-certs"):
+        if name != "etcd-all-certs":
             continue
         raw = env.run(
             f"{clone_oc} get secret {shlex.quote(name)} -n openshift-etcd -o json",
@@ -2437,6 +2445,9 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         _clone_log(work, "start kubelet on master-0-0 so it loads the quorum client CA")
         _vm(recert_node["ip"], compact_start_recert_node_script(), identity, check=False)
         _wait_admin_auth(src_kc, recert_node)
+        early_oc = _oc(src_kc, f"https://{api_ip}:6443")
+        _clone_log(work, "etcd certificate inputs updated; the operator rollout overlaps the rest of the heal")
+        _sync_reissued_etcd_certs(early_oc, nodes, identity, work, copy_to_nodes=False)
         _sync_requestheader_aggregator_ca(src_kc, api_ip, work, identity, quorum["ip"])
 
         _clone_log(work, "sign kubelet certificates with the live CSR signer")
@@ -2479,9 +2490,10 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
     if "yes" not in env.run(f"test -f {shlex.quote(clone_kc)} && echo yes || true").stdout:
         env.run(f"cp {shlex.quote(src_kc)} {shlex.quote(clone_kc)}")
     clone_oc = _oc(clone_kc, f"https://{api_ip}:6443")
-    if start_at != "health":
-        _clone_log(work, "install reissued etcd certificates into the etcd bundle secrets")
+    if start_at == "rewrite":
+        _clone_log(work, "etcd certificate inputs updated; the operator rollout overlaps the rest of the heal")
         _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes=False)
+    if start_at != "health":
         _clone_log(work, "rewrite cluster records and 00-master")
         domain = f"test-infra-cluster-{clone_id}.redhat.com"
         for kind, namespace, name in HEAL_API_OBJECTS:
@@ -2609,15 +2621,14 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
         env.run(
             f"{clone_oc} delete pod -n openshift-ovn-kubernetes -l app=ovnkube-node --force --grace-period=0",
             check=False)
-        _clone_log(work, "install reissued etcd certificates over the operator revision")
-        _sync_reissued_etcd_certs(clone_oc, nodes, identity, work, copy_to_nodes=True)
 
-    _clone_log(work, "wait for three Ready nodes, an etcd leader, and green operators")
+    _clone_log(work, "wait for core operators; etcd must stay up for two samples")
     deadline = time.time() + 40 * 60
     last = None
     last_auth = "unchecked"
     last_domains = "unchecked"
     webhook_confirmed = False
+    stable_samples = 0
     while time.time() < deadline:
         for node in nodes:
             _vm(node["ip"],
@@ -2663,14 +2674,13 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             and nni_parts[0] == str(len(COMPACT_ROLES))
         )
         last = health
+        core_unhealthy, post_unhealthy = compact_split_operators(health["unhealthy_operators"])
+        stage = compact_readiness_stage(
+            health["ready"], addresses_ok, health["etcd_started"], etcd_pods, health["leader"], core_unhealthy)
         admin_auth = compact_admin_auth_results(clone_kc, nodes)
         admin_failed = [item["role"] for item in admin_auth if not item["ok"]]
-        operators_ready = health["ok"] or (
-            health["ready"] == len(COMPACT_ROLES) and health["etcd_started"] == len(COMPACT_ROLES)
-            and health["leader"] and health["unhealthy_operators"] == ["insights"]
-        )
         sa_failed = []
-        if operators_ready and not admin_failed:
+        if stage == "core-ready" and not admin_failed:
             sa_auth = compact_serviceaccount_auth_results(clone_oc, nodes, work)
             sa_failed = [item["role"] for item in sa_auth if not item["ok"]]
             auth_ready = compact_auth_ready(admin_auth, sa_auth)
@@ -2684,31 +2694,36 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             compact_apply_clone_ingress_domain(clone_oc, clone_id, work)
             domains = compact_identity_domains(clone_oc)
             domains_ready = compact_identity_domains_ready(domains, clone_id)
-        if "console" in health["unhealthy_operators"] or "ingress" in health["unhealthy_operators"]:
+        if "console" in post_unhealthy or "ingress" in post_unhealthy:
             _sync_ingress_wildcard(clone_oc, clone_id, work)
         domain_detail = (
             f"dns={domains['base_domain'] or 'missing'} "
             f"ingress={domains['apps_domain'] or 'missing'}"
         )
         last_domains = domain_detail
+        if stage != "core-ready" or not auth_ready or not domains_ready:
+            stable_samples = 0
+            reported_stage = stage if stage != "core-ready" else "core"
+        else:
+            stable_samples += 1
+            reported_stage = "ready" if not post_unhealthy else "post-boot"
         _clone_log(
             work,
-            f"health ready={health['ready']} etcd={health['etcd_started']} leader={health['leader']} "
+            f"health stage={reported_stage} stable={stable_samples} "
+            f"ready={health['ready']} etcd={health['etcd_started']} leader={health['leader']} "
             f"etcdpods={etcd_pods} ips={'ok' if addresses_ok else 'stale'} "
-            f"unhealthy={','.join(health['unhealthy_operators']) or 'none'} auth={auth_detail} "
-            f"{domain_detail}")
-        clone_ready = operators_ready and auth_ready and domains_ready and addresses_ok and etcd_pods == len(COMPACT_ROLES)
-        if not clone_ready:
-            if webhook_confirmed:
-                _set_node_identity_webhook(clone_oc, "Ignore")
-                webhook_confirmed = False
-        elif not nni_ready:
-            webhook_confirmed = False
-        elif not webhook_confirmed:
+            f"core={','.join(core_unhealthy) or 'none'} post={','.join(post_unhealthy) or 'none'} "
+            f"auth={auth_detail} {domain_detail}")
+        if stable_samples == 1 and nni_ready and not webhook_confirmed:
             _set_node_identity_webhook(clone_oc, "Fail")
             webhook_confirmed = True
-        else:
-            if health["unhealthy_operators"] == ["insights"]:
+        if stable_samples >= 2 and reported_stage in ("ready", "post-boot"):
+            if reported_stage == "post-boot":
+                _clone_log(
+                    work,
+                    f"Compact clone {clone_id} is core-ready. Still progressing: "
+                    f"{','.join(post_unhealthy)}. Log: {work}/clone.log")
+            elif "insights" in health["unhealthy_operators"]:
                 _clone_log(
                     work,
                     f"Compact clone {clone_id} is up. insights is Degraded because the Red Hat "
@@ -2716,6 +2731,9 @@ def _finish_compact_clone(source, clone_id, nodes, identity, work, crypto, etcd_
             else:
                 _clone_log(work, f"Compact clone {clone_id} is healthy. Log: {work}/clone.log")
             return health
+        if webhook_confirmed and stable_samples == 0:
+            _set_node_identity_webhook(clone_oc, "Ignore")
+            webhook_confirmed = False
         time.sleep(30)
     sys.exit(
         f"Clone did not become healthy within 40 minutes: {last} auth={last_auth} {last_domains}. "
@@ -3178,6 +3196,35 @@ def parse_oc_co(text):
             "degraded": parts[4],
         })
     return operators
+
+
+CORE_OPERATORS = frozenset({
+    "authentication",
+    "etcd",
+    "kube-apiserver",
+    "kube-controller-manager",
+    "kube-scheduler",
+    "network",
+    "openshift-apiserver",
+})
+
+
+def compact_split_operators(unhealthy):
+    """Split unhealthy operators into the core gate and the post-boot gate."""
+    core = [name for name in unhealthy if name in CORE_OPERATORS]
+    post = [name for name in unhealthy if name not in CORE_OPERATORS and name != "insights"]
+    return core, post
+
+
+def compact_readiness_stage(ready, addresses_ok, etcd_started, etcd_pods, leader, core_unhealthy):
+    """Name the earliest core condition that is still blocking."""
+    if ready < len(COMPACT_ROLES) or not addresses_ok:
+        return "nodes"
+    if etcd_started < len(COMPACT_ROLES) or etcd_pods < len(COMPACT_ROLES) or not leader or "etcd" in core_unhealthy:
+        return "etcd-rollout"
+    if core_unhealthy:
+        return "core"
+    return "core-ready"
 
 
 def compact_health(nodes, etcd_members, operators):
