@@ -1515,22 +1515,47 @@ def compact_etcd_member_ips(manifest):
 
 def compact_vips_from_nodeip_service(unit):
     """Read the source API and ingress VIPs from the guest node-IP service."""
+    # The systemd unit uses shell line continuations, while newer variants may
+    # pass these as explicit flags. Normalize continuations before inspecting it.
+    unit = re.sub(r"\\[ \t]*\n", " ", unit or "")
     found = {}
     for key, option in (("api_vip", "--api-vips"), ("ingress_vip", "--ingress-vips")):
         matches = re.findall(
             rf"(?<!\S){re.escape(option)}(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))",
-            unit or "",
+            unit,
         )
         values = [next(value for value in match if value) for match in matches]
-        if len(values) != 1:
+        if len(values) == 1:
+            found[key] = values[0]
+        elif values:
             sys.exit(f"Could not read one {option} address from the flavor nodeip-configuration.service")
+
+    if not found:
+        # Current RHCOS units invoke `node-ip set` with API and ingress VIPs as
+        # its two positional addresses after the flags.
+        command = re.search(r"\bnode-ip\s+set\b(.*?);", unit, flags=re.S)
+        if not command:
+            sys.exit("Could not find the node-ip set command in the flavor nodeip-configuration.service")
+        addresses = re.findall(
+            r"(?<![A-Za-z0-9_.])(?:\d{1,3}\.){3}\d{1,3}(?![A-Za-z0-9_.])",
+            command.group(1),
+        )
+        if len(addresses) != 2:
+            sys.exit(
+                "Could not read the API and ingress VIPs from the flavor nodeip-configuration.service"
+            )
+        found = dict(zip(("api_vip", "ingress_vip"), addresses))
+
+    for key, value in found.items():
         try:
-            address = ipaddress.ip_address(values[0])
+            address = ipaddress.ip_address(value)
         except ValueError:
-            sys.exit(f"Invalid {option} address in the flavor nodeip-configuration.service: {values[0]}")
+            sys.exit(f"Invalid {key.replace('_', ' ')} in the flavor nodeip-configuration.service: {value}")
         if address.version != 4:
-            sys.exit(f"Expected an IPv4 {option} address in the flavor nodeip-configuration.service")
+            sys.exit(f"Expected an IPv4 {key.replace('_', ' ')} in the flavor nodeip-configuration.service")
         found[key] = str(address)
+    if set(found) != {"api_vip", "ingress_vip"}:
+        sys.exit("Could not read both VIP addresses from the flavor nodeip-configuration.service")
     return found["api_vip"], found["ingress_vip"]
 
 
@@ -3402,8 +3427,6 @@ def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, mem
             sys.exit(f"Nothing to resume at {work}.")
     elif "yes" in exists.stdout:
         sys.exit(f"{work} already exists. Remove that clone before running this one.")
-    else:
-        record_compact_clone(clone_id, subnet, flavor_name)
     fdir = flavor_dir(flavor_name)
     node_disks = []
     for _, os_name, spare_name in groups:
@@ -3425,11 +3448,13 @@ def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, mem
     source = compact_source_from_layout(
         flavor, macs, bases, node_disks, node_ips=member_ips,
         api_vip=source_api_vip, ingress_vip=source_ingress_vip)
-    env.run(f"mkdir -p {shlex.quote(work)} && chmod 755 {shlex.quote(work)}")
-    _clone_log(work, f"read identity from flavor {flavor_name}")
     kubeconfig = _guest_cat(
         os_disks[0],
         "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig")
+    if resume != "recert":
+        record_compact_clone(clone_id, subnet, flavor_name)
+    env.run(f"mkdir -p {shlex.quote(work)} && chmod 755 {shlex.quote(work)}")
+    _clone_log(work, f"read identity from flavor {flavor_name}")
     env.write_file(f"{work}/source.kubeconfig", kubeconfig)
     env.run(f"chmod 600 {shlex.quote(work + '/source.kubeconfig')}")
     nodes = compact_node_plan(clone_id, subnet, macs)
