@@ -2157,11 +2157,15 @@ def _ensure_api_certificates(oc, work, domain, api_ip, nodes, identity):
             _presented_san(api_ip, wanted["internal-loadbalancer-serving-certkey"]),
             wanted["internal-loadbalancer-serving-certkey"],
         ):
+            _clone_log(work, "API certificates present for clone names")
             return
         for node in nodes:
             _vm(node["ip"], compact_reload_apiserver_script(), identity, check=False)
         time.sleep(15)
-    _clone_log(work, "API certificate does not yet present the clone name")
+    sys.exit(
+        f"The API server is not presenting the clone internal name "
+        f"{wanted['internal-loadbalancer-serving-certkey']}; kubelets cannot trust the API. "
+        f"Log: {work}/clone.log")
 
 
 def _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity):
@@ -2758,6 +2762,18 @@ def _load_revision_baselines(work):
     return compact_valid_revision_baselines(payload)
 
 
+def _load_revision_baseline(work, name):
+    """Load one saved pre-rollout revision when a compact run resumes mid-flow."""
+    raw = env.run(
+        f"cat {shlex.quote(_revision_baselines_path(work))} 2>/dev/null || true",
+        check=False)
+    try:
+        value = json.loads(raw.stdout or "").get(name)
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    return value if _revision_int(value) else None
+
+
 def _store_revision_baseline(work, name, value):
     """Persist one pre-rollout revision without dropping the other."""
     if not _revision_int(value):
@@ -2858,7 +2874,10 @@ def _wait_master_render(clone_oc, previous_render):
         sys.exit("Cannot wait for a new master render without the previous MCP render name")
     current_render = ""
     last_error = ""
-    for _ in range(30):
+    # A fresh API certificate can take up to 90 seconds to propagate and reload.
+    # Allow MCO more time to reconnect and render in parallel; the common case
+    # still returns immediately when the new render appears.
+    for _ in range(90):
         result = env.run(
             f"{clone_oc} get mcp master -o jsonpath='{{.spec.configuration.name}}'",
             check=False)
@@ -2870,7 +2889,7 @@ def _wait_master_render(clone_oc, previous_render):
         time.sleep(2)
     error_detail = f"; last error: {last_error}" if last_error else ""
     sys.exit(
-        "Timed out after 60 seconds waiting for a new master MachineConfig render "
+        "Timed out after 180 seconds waiting for a new master MachineConfig render "
         f"(previous={previous_render}, current={current_render or 'unavailable'}"
         f"{error_detail}).")
 
@@ -3044,6 +3063,7 @@ def _finish_compact_clone(
         f"prepared runner kubeconfig {clone_kc} server=https://{api_vip}:6443 "
         f"tls-server-name=api.{domain}")
     if start_at == "rewrite":
+        etcd_revision_baseline = _load_revision_baseline(work, "etcd")
         certs = _require_reissued_etcd_certs(clone_oc, nodes, identity, work)
         if _revision_int(certs.get("etcd_revision_baseline")):
             etcd_revision_baseline = certs["etcd_revision_baseline"]
@@ -3123,16 +3143,24 @@ def _finish_compact_clone(
             compact_apply_clone_ingress_domain(clone_oc, clone_id, work)
             _sync_ingress_wildcard(clone_oc, clone_id, work)
 
-        parallel_steps = [
-            ("render", lambda: _wait_master_render(clone_oc, previous_render)),
-            ("identity", apply_identity_records),
-        ]
+        # Let the API identity settle before replacing serving certificates. The
+        # pull secret is independent and can be staged alongside those changes.
+        preparation_steps = [("identity", apply_identity_records)]
         if pull_secret is not None:
-            parallel_steps.append((
+            preparation_steps.append((
                 "pull-secret",
                 lambda: _inject_compact_pull_secret(clone_oc, work, pull_secret),
             ))
-        parallel_results = _call_together(dict(parallel_steps))
+        _call_together(dict(preparation_steps))
+
+        # Kubelets need the clone internal API certificate to reconnect. Repair it
+        # while MCO renders so its controller can come back and publish the render.
+        _clone_log(work, "ensure clone API certificates while waiting for MCO render")
+        parallel_results = _call_together({
+            "render": lambda: _wait_master_render(clone_oc, previous_render),
+            "api-certificates": lambda: _ensure_api_certificates(
+                clone_oc, work, domain, api_vip, nodes, identity),
+        })
         rendered = parallel_results["render"]
         raw_render = env.run(
             f"{clone_oc} get machineconfig {shlex.quote(rendered)} -o json", check=False)
@@ -3196,6 +3224,8 @@ def _finish_compact_clone(
     elif pull_secret is not None:
         _inject_compact_pull_secret(clone_oc, work, pull_secret)
         _ensure_api_certificates(clone_oc, work, domain, api_vip, nodes, identity)
+
+    if start_at != "health" or pull_secret is not None:
         _clone_log(work, "rewrite etcd pod manifests laid down by the operator")
         env.write_file(f"{work}/identity-pairs.json", json.dumps(pairs))
         env.write_file(f"{work}/rewrite-identity.py", compact_identity_script())
@@ -3696,7 +3726,7 @@ def run_compact_from_flavor(
         if flavor.get(key) in (None, ""):
             sys.exit(f"Flavor '{flavor_name}' is missing {key}")
     source_subnet = int(flavor["source_primary_subnet"])
-    if resume == "recert":
+    if resume in ("recert", "rewrite", "health"):
         saved = (load_state().get("clones") or {}).get(clone_id)
         if not saved or saved.get("subnet_primary") is None:
             sys.exit(f"No reserved subnet is recorded for clone '{clone_id}'.")
@@ -3709,7 +3739,7 @@ def run_compact_from_flavor(
         sys.exit(f"Refusing to boot onto source subnet {subnet}.")
     work = f"/var/lib/libvirt/images/{clone_id}"
     exists = env.run(f"test -e {shlex.quote(work)} && echo yes || true")
-    if resume == "recert":
+    if resume in ("recert", "rewrite", "health"):
         if "yes" not in exists.stdout:
             sys.exit(f"Nothing to resume at {work}.")
     elif "yes" in exists.stdout:
@@ -3738,7 +3768,7 @@ def run_compact_from_flavor(
     kubeconfig = _guest_cat(
         os_disks[0],
         "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig")
-    if resume != "recert":
+    if resume not in ("recert", "rewrite", "health"):
         requested_subnet = subnet
         subnet = record_compact_clone(clone_id, subnet, flavor_name)
         if requested_subnet is None:
@@ -3752,20 +3782,21 @@ def run_compact_from_flavor(
         node["hostname"] = node["role"]
         node["disk"] = f"{work}/{node['role']}.qcow2"
     crypto = f"{work}/crypto"
-    if resume == "recert":
+    if resume in ("recert", "rewrite", "health"):
         ingress_cn = env.run(f"cat {shlex.quote(crypto + '/ingress-cn.txt')}").stdout.strip()
         if not ingress_cn:
-            sys.exit("Flavor crypto is missing ingress-cn.txt")
+            sys.exit(f"Existing clone crypto is missing ingress-cn.txt: {crypto}")
         if not identity:
             identity = f"{crypto}/cluster-tool.key"
         env.run(f"test -s {shlex.quote(identity)}")
         pairs = compact_identity_pairs(source, clone_id, nodes)
         by_role = {node["role"]: node for node in nodes}
         api_ip = by_role[QUORUM_ETCD_ROLE]["ip"]
-        _clone_log(work, "resume at Recert")
+        _clone_log(work, f"resume at {resume}")
         return _finish_compact_clone(
             source, clone_id, nodes, identity, work, crypto, flavor["etcd_image"], ingress_cn,
             "/out/summary.txt", by_role, api_ip, f"{work}/source.kubeconfig", pairs,
+            start_at=None if resume == "recert" else resume,
             pull_secret=pull_secret)
     flavor_crypto = flavor_crypto_dir(flavor_name)
     env.run(
@@ -5724,7 +5755,9 @@ def main():
     flavor_boot_p.add_argument("--pull-secret", help="Path to a runner pull-secret.json to inject after API recovery")
     flavor_boot_p.add_argument("--memory-kib", type=int, help="Override memory for each VM, in KiB")
     flavor_boot_p.add_argument("--vcpus", type=int, help="Override vCPU count for each VM")
-    flavor_boot_p.add_argument("--resume", choices=["recert"], help="Continue an existing clone at Recert")
+    flavor_boot_p.add_argument(
+        "--resume", choices=["recert", "rewrite", "health"],
+        help="Continue an existing clone at Recert, identity rewrite, or health check")
 
     sub.add_parser("servers", help="List connected servers")
 
