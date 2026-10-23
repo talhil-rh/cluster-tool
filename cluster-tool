@@ -1876,13 +1876,24 @@ def rewrite_machineconfig(raw, pairs):
         source = item.get("contents", {}).get("source", "")
         if "," not in source or not source.startswith("data:"):
             continue
-        header, encoded = source.split(",", 1)
+        header, payload = source.split(",", 1)
+        encoded_base64 = "base64" in header.lower()
         try:
-            body = base64.b64decode(encoded).decode()
+            if encoded_base64:
+                payload += "=" * ((4 - len(payload) % 4) % 4)
+                body = base64.b64decode(payload).decode()
+            else:
+                body = urllib.parse.unquote_to_bytes(payload).decode()
         except (UnicodeDecodeError, ValueError):
             continue
-        item["contents"]["source"] = header + "," + base64.b64encode(
-            apply_identity_preserving_pems(body, pairs).encode()).decode()
+        updated = apply_identity_preserving_pems(body, pairs)
+        if updated == body:
+            continue
+        rewritten_payload = (
+            base64.b64encode(updated.encode()).decode()
+            if encoded_base64 else urllib.parse.quote(updated, safe="")
+        )
+        item["contents"]["source"] = header + "," + rewritten_payload
     for unit in config.get("systemd", {}).get("units", []):
         if unit.get("contents"):
             unit["contents"] = apply_identity_preserving_pems(unit["contents"], pairs)
