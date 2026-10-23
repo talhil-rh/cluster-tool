@@ -822,8 +822,12 @@ def compact_identity_pairs(source, clone_id, new_nodes):
     short_names.add(f"test-infra-cluster-{clone_id}")
     for name in short_names:
         pairs.append((name, f"test-infra-cluster-{clone_id}"))
-    pairs.append((source["api_vip"], f"192.168.{subnet}.{COMPACT_API_SUFFIX}"))
-    pairs.append((source["ingress_vip"], f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}"))
+    api_vips = source.get("api_vips") or [source["api_vip"]]
+    ingress_vips = source.get("ingress_vips") or [source["ingress_vip"]]
+    for vip in dict.fromkeys(api_vips):
+        pairs.append((vip, f"192.168.{subnet}.{COMPACT_API_SUFFIX}"))
+    for vip in dict.fromkeys(ingress_vips):
+        pairs.append((vip, f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}"))
     if source.get("gateway"):
         pairs.append((source["gateway"], f"192.168.{subnet}.1"))
     if source.get("machine_network"):
@@ -1509,13 +1513,40 @@ def compact_etcd_member_ips(manifest):
     return found
 
 
-def compact_source_from_layout(flavor, macs, dns_bases, disk_paths, node_ips=None):
+def compact_vips_from_nodeip_service(unit):
+    """Read the source API and ingress VIPs from the guest node-IP service."""
+    found = {}
+    for key, option in (("api_vip", "--api-vips"), ("ingress_vip", "--ingress-vips")):
+        matches = re.findall(
+            rf"(?<!\S){re.escape(option)}(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))",
+            unit or "",
+        )
+        values = [next(value for value in match if value) for match in matches]
+        if len(values) != 1:
+            sys.exit(f"Could not read one {option} address from the flavor nodeip-configuration.service")
+        try:
+            address = ipaddress.ip_address(values[0])
+        except ValueError:
+            sys.exit(f"Invalid {option} address in the flavor nodeip-configuration.service: {values[0]}")
+        if address.version != 4:
+            sys.exit(f"Expected an IPv4 {option} address in the flavor nodeip-configuration.service")
+        found[key] = str(address)
+    return found["api_vip"], found["ingress_vip"]
+
+
+def compact_source_from_layout(flavor, macs, dns_bases, disk_paths, node_ips=None,
+                               api_vip=None, ingress_vip=None):
     """Build a compact source record from flavor metadata and disk paths."""
     if len(macs) != len(COMPACT_ROLES) or len(disk_paths) != len(COMPACT_ROLES):
         sys.exit("A compact flavor needs three masters and three MAC addresses")
     subnet = int(flavor["source_primary_subnet"])
-    api = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
-    ingress = f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}"
+    api = api_vip or f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
+    ingress = ingress_vip or f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}"
+    # Some source clusters assign the API and ingress VIPs at addresses that
+    # differ from the compact network's standard .5/.10 DNS addresses. Rewrite
+    # both the configured VIPs and those standard addresses in guest files.
+    api_vips = list(dict.fromkeys((api, f"192.168.{subnet}.{COMPACT_API_SUFFIX}")))
+    ingress_vips = list(dict.fromkeys((ingress, f"192.168.{subnet}.{COMPACT_INGRESS_SUFFIX}")))
     nodes = []
     for role, suffix, mac, paths in zip(COMPACT_ROLES, COMPACT_NODE_SUFFIXES, macs, disk_paths):
         if isinstance(paths, str):
@@ -1545,6 +1576,8 @@ def compact_source_from_layout(flavor, macs, dns_bases, disk_paths, node_ips=Non
         "machine_network": f"192.168.{subnet}.0/24",
         "api_vip": api,
         "ingress_vip": ingress,
+        "api_vips": api_vips,
+        "ingress_vips": ingress_vips,
         "memory_kib": flavor["memory_kib"],
         "vcpus": flavor["vcpus"],
         "etcd_image": flavor["etcd_image"],
@@ -3387,7 +3420,11 @@ def run_compact_from_flavor(flavor_name, flavor, clone_id, subnet, identity, mem
     macs = [_guest_mac(path) for path in os_disks]
     member_ips = compact_etcd_member_ips(
         _guest_cat(os_disks[0], "/etc/kubernetes/manifests/etcd-pod.yaml"))
-    source = compact_source_from_layout(flavor, macs, bases, node_disks, node_ips=member_ips)
+    source_api_vip, source_ingress_vip = compact_vips_from_nodeip_service(
+        _guest_cat(os_disks[0], "/etc/systemd/system/nodeip-configuration.service"))
+    source = compact_source_from_layout(
+        flavor, macs, bases, node_disks, node_ips=member_ips,
+        api_vip=source_api_vip, ingress_vip=source_ingress_vip)
     env.run(f"mkdir -p {shlex.quote(work)} && chmod 755 {shlex.quote(work)}")
     _clone_log(work, f"read identity from flavor {flavor_name}")
     kubeconfig = _guest_cat(
