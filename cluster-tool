@@ -2719,7 +2719,6 @@ def _recover_compact_api_certificates_and_endpoints(
 ):
     """Refresh API certs and lease-backed endpoints before MCO waits on the API service."""
     _recover_compact_api_certificates(clone_oc, work, domain, api_ip, nodes, identity)
-    _ensure_compact_mcd_pod_addresses(clone_oc, nodes, work)
     _ensure_compact_apiserver_host_ips(nodes, identity, work)
     _clear_compact_stale_master_leases(nodes, identity, etcd_image, work)
     if _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work) is not True:
@@ -4415,6 +4414,7 @@ def _finish_compact_clone(
     last_observe_signature = None
     endpoint_repair_failures = 0
     endpoint_detail = "not observed"
+    mcd_addresses_verified = False
     endpoints = ",".join(f"https://{node['ip']}:2379" for node in nodes)
     while time.time() < deadline:
         watched = _call_together({
@@ -4452,6 +4452,12 @@ def _finish_compact_clone(
             last_mco_node_sample = mco_node_signature
         addresses_ok = compact_node_ips_ready(parsed_nodes, nodes)
         ready = sum(1 for node in parsed_nodes if node.get("ready"))
+        if ready == len(nodes) and addresses_ok and not mcd_addresses_verified:
+            _clone_log(
+                work,
+                "refresh machine-config-daemon host addresses after all clone nodes are Ready")
+            _ensure_compact_mcd_pod_addresses(clone_oc, nodes, work)
+            mcd_addresses_verified = True
         unhealthy = [
             op["name"] for op in operators
             if op.get("available") != "True" or op.get("progressing") != "False" or op.get("degraded") != "False"
@@ -4583,7 +4589,7 @@ def _finish_compact_clone(
         if not compact_install_observation_ready(
             ready, addresses_ok, core_unhealthy, install_blockers, revisions_ready,
             machine_config_ready, endpoint_ready,
-        ):
+        ) or not mcd_addresses_verified:
             stable_samples = 0
             if webhook_confirmed:
                 _set_node_identity_webhook(clone_oc, "Ignore")
@@ -4591,6 +4597,7 @@ def _finish_compact_clone(
             signature = (
                 ready, addresses_ok, tuple(core_unhealthy), tuple(install_blockers),
                 revision_sample, machine_config_detail, endpoint_ready, endpoint_detail,
+                mcd_addresses_verified,
             )
             if signature != last_observe_signature:
                 _clone_log(
@@ -4599,6 +4606,7 @@ def _finish_compact_clone(
                     f"core={','.join(core_unhealthy) or 'none'} "
                     f"install={','.join(install_blockers) or 'none'} "
                     f"mco={'ready' if machine_config_ready else machine_config_detail} "
+                    f"mcd-pods={'ready' if mcd_addresses_verified else 'pending'} "
                     f"api-endpoints={'ready' if endpoint_ready else endpoint_detail}")
                 last_observe_signature = signature
             time.sleep(10)

@@ -1663,16 +1663,20 @@ class TestCompactInspect(unittest.TestCase):
     def test_api_recovery_refreshes_host_ips_and_stale_leases_before_endpoints(self):
         source = inspect.getsource(ct._recover_compact_api_certificates_and_endpoints)
         certs = source.index("_recover_compact_api_certificates(")
-        mcd_ips = source.index("_ensure_compact_mcd_pod_addresses(")
         host_ips = source.index("_ensure_compact_apiserver_host_ips(")
         leases = source.index("_clear_compact_stale_master_leases(")
         endpoints = source.index("_refresh_compact_kubernetes_endpoints(")
         self.assertLess(certs, host_ips)
-        self.assertLess(mcd_ips, host_ips)
+        self.assertNotIn("_ensure_compact_mcd_pod_addresses(", source)
         self.assertLess(host_ips, leases)
         self.assertLess(leases, endpoints)
         finish = inspect.getsource(ct._finish_compact_clone)
         self.assertIn("_recover_compact_api_certificates_and_endpoints(", finish)
+        ready_check = finish.index("if ready == len(nodes) and addresses_ok")
+        mcd_refresh = finish.index("_ensure_compact_mcd_pod_addresses(")
+        install_gate = finish.index("compact_install_observation_ready(")
+        self.assertLess(ready_check, mcd_refresh)
+        self.assertLess(mcd_refresh, install_gate)
 
     def test_clone_copy_keeps_source_disks_and_reissues_etcd_certs(self):
         source_nodes = [
