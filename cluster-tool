@@ -1903,6 +1903,43 @@ def rewrite_machineconfig(raw, pairs):
     return json.dumps(doc)
 
 
+def compact_ensure_machineconfig_render_change(previous_raw, rewritten_raw, clone_domain):
+    """Ensure a retry changes 00-master spec so MCO queues a fresh render."""
+    previous = json.loads(previous_raw)
+    rewritten = json.loads(rewritten_raw)
+    if previous.get("spec") != rewritten.get("spec"):
+        return json.dumps(rewritten)
+
+    path = "/etc/kubernetes/apiserver-url.env"
+    body = rendered_machineconfig_files(rewritten).get(path)
+    wanted = f"KUBERNETES_SERVICE_HOST='api-int.{clone_domain}'"
+    if not body or wanted not in body.splitlines():
+        sys.exit(
+            "Cannot retrigger the master render: 00-master does not contain the "
+            "clone-specific API URL")
+
+    for item in rewritten.get("spec", {}).get("config", {}).get("storage", {}).get("files") or []:
+        if item.get("path") != path:
+            continue
+        source = (item.get("contents") or {}).get("source") or ""
+        if not source.startswith("data:") or "," not in source:
+            break
+        header = source.split(",", 1)[0]
+        if "base64" in header.lower():
+            payload = urllib.parse.quote(body, safe="")
+            item["contents"]["source"] = "data:," + payload
+        else:
+            payload = base64.b64encode(body.encode()).decode()
+            item["contents"]["source"] = "data:;base64," + payload
+        if previous.get("spec") == rewritten.get("spec"):
+            break
+        return json.dumps(rewritten)
+
+    sys.exit(
+        "Cannot retrigger the master render: 00-master has no data URL for "
+        "/etc/kubernetes/apiserver-url.env")
+
+
 def rewrite_configmap(raw, pairs):
     """Rewrite a ConfigMap with compact identity replacements."""
     doc = json.loads(raw)
@@ -3078,7 +3115,10 @@ def _finish_compact_clone(
             sys.exit(f"Could not read MachineConfig 00-master before the clone rewrite. Log: {work}/clone.log")
         if not previous_render:
             sys.exit(f"Could not read the current master render before the clone rewrite. Log: {work}/clone.log")
-        env.write_file(f"{work}/00-master.json", rewrite_machineconfig(mc.stdout, pairs))
+        rewritten_mc = rewrite_machineconfig(mc.stdout, pairs)
+        rewritten_mc = compact_ensure_machineconfig_render_change(
+            mc.stdout, rewritten_mc, domain)
+        env.write_file(f"{work}/00-master.json", rewritten_mc)
         replaced = env.run(f"{clone_oc} replace -f {shlex.quote(work + '/00-master.json')}", check=False)
         if replaced.returncode != 0:
             detail = (replaced.stderr or "").strip()
