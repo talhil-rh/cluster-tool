@@ -1130,25 +1130,57 @@ def rendered_machineconfig_files(raw):
     return files
 
 
-def compact_machineconfig_identity(raw, clone_domain):
-    """Return the rendered name and clone-specific apiserver URL file, or fail closed."""
+def _compact_machineconfig_identity(raw, clone_domain, require_render_name=True):
+    """Return MachineConfig identity details without terminating on an invalid candidate."""
+    errors = []
     try:
         doc = json.loads(raw) if isinstance(raw, str) else raw
     except (json.JSONDecodeError, TypeError):
-        sys.exit("The desired master render is not valid JSON")
+        return "", "", ["not valid JSON"]
     if not isinstance(doc, dict):
-        sys.exit("The desired master render is not a JSON object")
+        return "", "", ["not a JSON object"]
     name = (doc.get("metadata") or {}).get("name", "")
     files = rendered_machineconfig_files(doc)
     api_url = files.get("/etc/kubernetes/apiserver-url.env", "")
-    expected_host = f"KUBERNETES_SERVICE_HOST='api-int.{clone_domain}'"
-    if not name.startswith("rendered-master-"):
-        sys.exit("The desired master render has no rendered-master name")
-    if expected_host not in api_url.splitlines():
-        sys.exit(
-            "The desired master render is missing the clone-specific "
-            "/etc/kubernetes/apiserver-url.env")
+    coredns = files.get("/etc/kubernetes/static-pod-resources/coredns/Corefile.tmpl", "")
+    expected_api_host = f"KUBERNETES_SERVICE_HOST='api-int.{clone_domain}'"
+    expected_apps_domain = f"apps.{clone_domain}"
+    if require_render_name and not name.startswith("rendered-master-"):
+        errors.append("missing rendered-master name")
+    if expected_api_host not in api_url.splitlines():
+        errors.append("missing clone-specific /etc/kubernetes/apiserver-url.env")
+    if not coredns:
+        errors.append("missing CoreDNS Corefile.tmpl")
+    elif expected_apps_domain not in coredns:
+        errors.append(f"missing clone apps domain {expected_apps_domain} in CoreDNS Corefile.tmpl")
+    else:
+        # A Corefile can contain multiple generated API/DNS aliases. Reject a
+        # mixed render that has the clone apps domain alongside source-cluster
+        # aliases; MCD will report a content mismatch and the node rollout can
+        # never converge on this render.
+        aliases = re.findall(
+            r"\b(?:api-int|api|apps)\.([A-Za-z0-9.-]+\.redhat\.com)\b",
+            coredns,
+            flags=re.IGNORECASE,
+        )
+        stale_aliases = sorted({alias for alias in aliases if alias.lower() != clone_domain.lower()})
+        if stale_aliases:
+            errors.append("contains non-clone CoreDNS aliases: " + ", ".join(stale_aliases))
+    return name, api_url, errors
+
+
+def compact_machineconfig_identity(raw, clone_domain):
+    """Return a rendered name and API URL only when API and CoreDNS identity match."""
+    name, api_url, errors = _compact_machineconfig_identity(raw, clone_domain)
+    if errors:
+        sys.exit("The desired master render has invalid clone identity: " + "; ".join(errors))
     return name, api_url
+
+
+def compact_machineconfig_has_clone_identity(raw, clone_domain):
+    """Whether a rendered MachineConfig has both clone API and CoreDNS identity."""
+    name, _api_url, errors = _compact_machineconfig_identity(raw, clone_domain)
+    return name.startswith("rendered-master-") and not errors
 
 
 def compact_machineconfig_has_clone_api_url(raw, clone_domain):
@@ -1180,6 +1212,13 @@ def compact_machineconfig_input_has_clone_api_url(raw, clone_domain):
     return wanted in api_url.splitlines()
 
 
+def compact_machineconfig_input_has_clone_identity(raw, clone_domain):
+    """Whether the 00-master input contains the complete clone API/CoreDNS identity."""
+    _name, _api_url, errors = _compact_machineconfig_identity(
+        raw, clone_domain, require_render_name=False)
+    return not errors
+
+
 def compact_controllerconfig_infra_matches(raw, clone_domain, api_vip, subnet):
     """Whether the MCO's embedded Infrastructure snapshot matches this clone."""
     try:
@@ -1205,6 +1244,23 @@ def compact_controllerconfig_infra_matches(raw, clone_domain, api_vip, subnet):
         and baremetal.get("machineNetworks") == [network]
         and spec_baremetal.get("apiServerInternalIPs") == [api_vip]
         and spec_baremetal.get("machineNetworks") == [network]
+    )
+
+
+def compact_controllerconfig_dns_matches(raw, expected_dns, clone_domain):
+    """Whether the MCO's embedded DNS snapshot matches the clone DNS resource."""
+    try:
+        doc = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(doc, dict) or not isinstance(expected_dns, dict):
+        return False
+    current = ((doc.get("spec") or {}).get("dns") or {})
+    return (
+        current.get("apiVersion") == expected_dns.get("apiVersion")
+        and current.get("kind") == expected_dns.get("kind") == "DNS"
+        and current.get("spec") == expected_dns.get("spec")
+        and (current.get("spec") or {}).get("baseDomain") == clone_domain
     )
 HEAL_NODE_FILES = (
     "/var/lib/kubelet/kubeconfig",
@@ -1924,40 +1980,162 @@ def compact_lease_is_expired(lease_raw, now=None):
         return False
 
 
+def compact_lease_delete_preconditions(lease_raw):
+    """Return UID and resourceVersion preconditions for a Kubernetes Lease."""
+    try:
+        lease = json.loads(lease_raw) if isinstance(lease_raw, str) else lease_raw
+        metadata = lease.get("metadata") or {}
+        uid = metadata.get("uid")
+        resource_version = metadata.get("resourceVersion")
+        if not uid or not resource_version:
+            return None
+        return {"uid": str(uid), "resourceVersion": str(resource_version)}
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def compact_kubernetes_delete_proxy_script(clone_oc, resource_path, preconditions):
+    """Delete one API object through oc proxy with Kubernetes DeleteOptions."""
+    if not resource_path.startswith(("/api/v1/", "/apis/coordination.k8s.io/v1/")):
+        raise ValueError("Kubernetes delete path must use a supported v1 API")
+    if not isinstance(preconditions, dict) or not preconditions.get("uid"):
+        raise ValueError("Kubernetes delete requires an observed UID precondition")
+    if any(key not in ("uid", "resourceVersion") for key in preconditions):
+        raise ValueError("Unsupported Kubernetes delete precondition")
+    options = json.dumps({
+        "apiVersion": "v1",
+        "kind": "DeleteOptions",
+        "preconditions": preconditions,
+    }, separators=(",", ":"))
+    script = textwrap.dedent("""\
+        set -euo pipefail
+        proxy_log=$(mktemp)
+        response=$(mktemp)
+        proxy_pid=
+        cleanup() {
+          if [ -n "$proxy_pid" ]; then
+            kill "$proxy_pid" >/dev/null 2>&1 || true
+            wait "$proxy_pid" >/dev/null 2>&1 || true
+          fi
+          rm -f "$proxy_log" "$response"
+        }
+        trap cleanup EXIT
+
+        __CLONE_OC__ proxy --address=127.0.0.1 --port=0 >"$proxy_log" 2>&1 &
+        proxy_pid=$!
+        port=
+        ready=0
+        attempt=0
+        while [ "$attempt" -lt 40 ]; do
+          attempt=$((attempt + 1))
+          port=$(grep -oE '127[.]0[.]0[.]1:[0-9]+' "$proxy_log" | head -n 1 | cut -d: -f2 || true)
+          if [ -n "$port" ] && curl --silent --show-error --fail \\
+              --connect-timeout 1 --max-time 2 "http://127.0.0.1:$port/version" >/dev/null; then
+            ready=1
+            break
+          fi
+          if ! kill -0 "$proxy_pid" 2>/dev/null; then
+            break
+          fi
+          sleep 0.25
+        done
+        if [ "$ready" -ne 1 ]; then
+          echo "oc proxy did not become ready for conditional API deletion"
+          cat "$proxy_log"
+          exit 1
+        fi
+
+        status=$(curl --silent --show-error --output "$response" \\
+          --write-out "%{http_code}" --connect-timeout 2 --max-time 10 \\
+          --request DELETE --header 'Content-Type: application/json' \\
+          --data-binary __DELETE_OPTIONS__ \\
+          "http://127.0.0.1:$port__RESOURCE_PATH__" || true)
+        printf 'KUBE_DELETE_HTTP_STATUS=%s\\n' "$status"
+        cat "$response"
+        case "$status" in
+          200|202|404) exit 0 ;;
+          409) exit 3 ;;
+          *) exit 1 ;;
+        esac
+        """)
+    return (script
+            .replace("__CLONE_OC__", clone_oc)
+            .replace("__DELETE_OPTIONS__", shlex.quote(options))
+            .replace("__RESOURCE_PATH__", resource_path))
+
+
 def _clear_expired_mco_controller_lease(clone_oc, work):
     """Drop only an expired MCO leader Lease restored from the source snapshot."""
     namespace, name = COMPACT_MCO_CONTROLLER_LEASE
     get_command = (
         f"{clone_oc} get lease {shlex.quote(name)} "
         f"-n {shlex.quote(namespace)} -o json")
-    lease = env.run(get_command, check=False)
-    if lease.returncode != 0:
-        _clone_log(work, "could not read the MCO controller lease; leaving it unchanged")
-        return
-    if not compact_lease_is_expired(lease.stdout):
-        _clone_log(
-            work,
-            "MCO controller lease is not demonstrably expired; leaving it unchanged")
-        return
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        lease = env.run(get_command, check=False)
+        if lease.returncode != 0:
+            if "not found" in (lease.stderr or "").lower():
+                _clone_log(work, "MCO controller lease is already absent")
+            else:
+                _clone_log(work, "could not read the MCO controller lease; leaving it unchanged")
+            return
+        if not compact_lease_is_expired(lease.stdout):
+            _clone_log(
+                work,
+                "MCO controller lease is not demonstrably expired; leaving it unchanged")
+            return
 
-    _clone_log(work, "removing expired MCO controller lease from the restored snapshot")
-    deleted = env.run(
-        f"{clone_oc} delete lease {shlex.quote(name)} "
-        f"-n {shlex.quote(namespace)} --ignore-not-found", check=False)
-    if deleted.returncode != 0:
-        _clone_log(work, "could not remove expired MCO lease; normal leader election will continue")
-        return
+        preconditions = compact_lease_delete_preconditions(lease.stdout)
+        if preconditions is None:
+            _clone_log(
+                work,
+                "MCO controller lease lacks UID/resourceVersion; leaving it unchanged")
+            return
+        observed_uid = preconditions["uid"]
+        observed_version = preconditions["resourceVersion"]
+        _clone_log(work, "conditionally removing expired MCO controller lease")
+        resource_path = (
+            f"/apis/coordination.k8s.io/v1/namespaces/{urllib.parse.quote(namespace, safe='')}"
+            f"/leases/{urllib.parse.quote(name, safe='')}"
+        )
+        delete_script = compact_kubernetes_delete_proxy_script(
+            clone_oc, resource_path, preconditions)
+        deleted = env.run(delete_script, check=False)
 
-    verified = env.run(get_command, check=False)
-    if verified.returncode != 0:
-        if "not found" in (verified.stderr or "").lower():
-            _clone_log(work, "verified removal of the expired MCO controller lease")
-        else:
-            _clone_log(work, "MCO lease cleanup applied; read-back was unavailable")
-    elif compact_lease_is_expired(verified.stdout):
-        _clone_log(work, "expired MCO lease remains; normal leader election will continue")
-    else:
-        _clone_log(work, "MCO controller lease was renewed during cleanup")
+        verified = env.run(get_command, check=False)
+        if verified.returncode != 0:
+            if "not found" in (verified.stderr or "").lower():
+                _clone_log(work, "verified removal of the expired MCO controller lease")
+            elif deleted.returncode == 0:
+                _clone_log(work, "MCO lease delete returned success; read-back was unavailable")
+            else:
+                _clone_log(work, "conditional MCO lease delete could not be verified; leaving it unchanged")
+            return
+
+        current_preconditions = compact_lease_delete_preconditions(verified.stdout)
+        if current_preconditions is None:
+            _clone_log(work, "MCO lease read-back lacks UID/resourceVersion; leaving it unchanged")
+            return
+        if current_preconditions["uid"] != observed_uid:
+            _clone_log(work, "MCO controller lease was replaced during cleanup; preserving replacement")
+            return
+        if not compact_lease_is_expired(verified.stdout):
+            _clone_log(work, "MCO controller lease was renewed during cleanup; preserving it")
+            return
+
+        current_version = current_preconditions["resourceVersion"]
+        if current_version == observed_version:
+            if deleted.returncode == 0:
+                _clone_log(work, "expired MCO controller lease remains after conditional delete")
+            else:
+                _clone_log(work, "could not remove expired MCO lease; normal leader election will continue")
+            return
+
+        # A conflict can be retried only after re-reading the same Lease and
+        # proving it is still expired. A new UID or renewal is preserved above.
+        _clone_log(work, "MCO lease changed during conditional delete; re-evaluating expiry")
+
+    _clone_log(work, "expired MCO lease kept changing; leaving it unchanged")
 
 
 def compact_stale_master_lease_keys(keys_output, node_ips):
@@ -2296,6 +2474,7 @@ def compact_mcd_pod_address_rows(raw):
         statuses = (pod.get("status") or {}).get("containerStatuses") or []
         rows[role] = {
             "name": name,
+            "uid": metadata.get("uid") or "",
             "ip": (pod.get("status") or {}).get("podIP") or "",
             "ready": bool(statuses) and all(item.get("ready") is True for item in statuses),
         }
@@ -2651,52 +2830,60 @@ def _ensure_compact_mcd_pod_addresses(clone_oc, nodes, work):
 
     for node in nodes:
         state = observe(node["role"])
-        if state and state["ip"] == node["ip"] and state["ready"]:
-            _clone_log(work, f"machine-config-daemon on {node['role']} already uses clone IP {node['ip']}")
-            continue
-
         deadline = time.monotonic() + 120
-        deleted_pods = set()
+        deleted_pod_uids = set()
         while time.monotonic() < deadline:
-            if state and state["ip"] == node["ip"] and state["ready"]:
-                _clone_log(work, f"machine-config-daemon on {node['role']} uses clone IP {node['ip']}")
-                break
-            pod_name = (state or {}).get("name")
-            if pod_name and pod_name not in deleted_pods:
-                if len(deleted_pods) >= 3:
+            if state and state["ip"] == node["ip"]:
+                if state["ready"]:
+                    _clone_log(work, f"machine-config-daemon on {node['role']} uses clone IP {node['ip']}")
                     break
-                _clone_log(
-                    work,
-                    f"replace stale machine-config-daemon pod {pod_name} on {node['role']} "
-                    f"(pod IP={(state or {}).get('ip') or 'pending'})")
-                deleted = env.run(
-                    f"{clone_oc} delete pod {shlex.quote(pod_name)} "
-                    "-n openshift-machine-config-operator --wait=false",
-                    check=False)
-                if deleted.returncode != 0:
-                    latest = observe(node["role"])
-                    if latest and latest["ip"] == node["ip"] and latest["ready"]:
-                        state = latest
-                        _clone_log(
-                            work,
-                            f"machine-config-daemon on {node['role']} uses clone IP {node['ip']}")
+                # Correctly addressed pods may need time for their containers
+                # and readiness probes to start. Never delete them just for that.
+            elif state and state.get("ip") and state["ip"] != node["ip"]:
+                pod_name = (state or {}).get("name")
+                pod_uid = (state or {}).get("uid")
+                if pod_name and pod_uid and pod_uid not in deleted_pod_uids:
+                    if len(deleted_pod_uids) >= 3:
                         break
-                    detail = (deleted.stderr or deleted.stdout or "pod deletion failed").strip()
-                    sys.exit(
-                        f"Could not replace stale machine-config-daemon pod on {node['role']}: "
-                        f"{detail}. Log: {work}/clone.log")
-                deleted_pods.add(pod_name)
+                    _clone_log(
+                        work,
+                        f"replace stale machine-config-daemon pod {pod_name} on {node['role']} "
+                        f"(pod IP={(state or {}).get('ip') or 'pending'})")
+                    resource_path = (
+                        "/api/v1/namespaces/openshift-machine-config-operator/pods/"
+                        f"{urllib.parse.quote(pod_name, safe='')}"
+                    )
+                    preconditions = {"uid": pod_uid}
+                    deleted = env.run(
+                        compact_kubernetes_delete_proxy_script(
+                            clone_oc, resource_path, preconditions),
+                        check=False)
+                    if deleted.returncode == 0:
+                        deleted_pod_uids.add(pod_uid)
+                    else:
+                        # A replacement between observation and delete is a
+                        # normal optimistic-concurrency conflict; observe again.
+                        latest = observe(node["role"])
+                        if (latest and latest.get("uid") == pod_uid
+                                and latest.get("ip") != node["ip"]):
+                            detail = (deleted.stderr or deleted.stdout or "pod deletion failed").strip()
+                            sys.exit(
+                                f"Could not replace stale machine-config-daemon pod on {node['role']}: "
+                                f"{detail}. Log: {work}/clone.log")
+                        state = latest
+                        time.sleep(2)
+                        continue
             time.sleep(2)
             state = observe(node["role"])
         else:
             sys.exit(
                 f"machine-config-daemon on {node['role']} did not become Ready with clone IP "
-                f"{node['ip']} after replacing stale pods {sorted(deleted_pods)}. "
+                f"{node['ip']} after replacing stale pod UIDs {sorted(deleted_pod_uids)}. "
                 f"Log: {work}/clone.log")
         if not (state and state["ip"] == node["ip"] and state["ready"]):
             sys.exit(
                 f"machine-config-daemon on {node['role']} kept a stale host-network address "
-                f"after replacing pods {sorted(deleted_pods)}. Log: {work}/clone.log")
+                f"after replacing pod UIDs {sorted(deleted_pod_uids)}. Log: {work}/clone.log")
 
 
 def _ensure_compact_apiserver_host_ips(nodes, identity, work):
@@ -3760,8 +3947,8 @@ def _refresh_compact_kubernetes_endpoints(
     return False if verified_invalid else None
 
 
-def _sync_compact_controllerconfig_infra(clone_oc, clone_id, subnet, work):
-    """Align the MCO's embedded Infrastructure snapshot with the live clone."""
+def _sync_compact_controllerconfig_identity(clone_oc, clone_id, subnet, work):
+    """Align the MCO's embedded Infrastructure and DNS snapshots with the clone."""
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
     api_vip = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
     live = env.run(f"{clone_oc} get infrastructure cluster -o json", check=False)
@@ -3779,22 +3966,48 @@ def _sync_compact_controllerconfig_infra(clone_oc, clone_id, subnet, work):
             "Infrastructure/cluster does not contain the clone API identity; "
             f"refusing to change the MCO ControllerConfig. Log: {work}/clone.log")
 
+    live_dns = env.run(f"{clone_oc} get dns.config.openshift.io cluster -o json", check=False)
+    if live_dns.returncode != 0 or not (live_dns.stdout or "").strip():
+        sys.exit(
+            "Could not read DNS/cluster before MCO render. "
+            f"Log: {work}/clone.log")
+    try:
+        dns = json.loads(live_dns.stdout)
+    except json.JSONDecodeError:
+        sys.exit(f"DNS/cluster was not valid JSON. Log: {work}/clone.log")
+    if ((dns.get("spec") or {}).get("baseDomain") != domain):
+        sys.exit(
+            "DNS/cluster does not contain the clone base domain; "
+            f"refusing to change the MCO ControllerConfig. Log: {work}/clone.log")
+
     current = env.run(
         f"{clone_oc} get controllerconfig machine-config-controller -o json", check=False)
     if current.returncode != 0 or not (current.stdout or "").strip():
         sys.exit(
             "Could not read the MCO ControllerConfig before render. "
             f"Log: {work}/clone.log")
-    if compact_controllerconfig_infra_matches(current.stdout, domain, api_vip, subnet):
-        _clone_log(work, "MCO ControllerConfig already has clone Infrastructure identity")
+    infra_matches = compact_controllerconfig_infra_matches(
+        current.stdout, domain, api_vip, subnet)
+    dns_matches = compact_controllerconfig_dns_matches(current.stdout, dns, domain)
+    if infra_matches and dns_matches:
+        _clone_log(work, "MCO ControllerConfig already has clone Infrastructure and DNS identity")
         return
 
-    embedded = {
+    patch_spec = {}
+    embedded_infra = {
         key: infra[key] for key in ("apiVersion", "kind", "spec", "status")
         if key in infra
     }
-    patch_path = f"{work}/controllerconfig-infra.json"
-    env.write_file(patch_path, json.dumps({"spec": {"infra": embedded}}))
+    embedded_dns = {
+        key: dns[key] for key in ("apiVersion", "kind", "spec", "status")
+        if key in dns
+    }
+    if not infra_matches:
+        patch_spec["infra"] = embedded_infra
+    if not dns_matches:
+        patch_spec["dns"] = embedded_dns
+    patch_path = f"{work}/controllerconfig-identity.json"
+    env.write_file(patch_path, json.dumps({"spec": patch_spec}))
     patched = env.run(
         f"{clone_oc} patch controllerconfig machine-config-controller --type=merge "
         f"--patch-file {shlex.quote(patch_path)}", check=False)
@@ -3808,17 +4021,33 @@ def _sync_compact_controllerconfig_infra(clone_oc, clone_id, subnet, work):
         f"{clone_oc} get controllerconfig machine-config-controller -o json", check=False)
     if (verified.returncode != 0 or not (verified.stdout or "").strip()
             or not compact_controllerconfig_infra_matches(
-                verified.stdout, domain, api_vip, subnet)):
+                verified.stdout, domain, api_vip, subnet)
+            or not compact_controllerconfig_dns_matches(
+                verified.stdout, dns, domain)):
         sys.exit(
-            "MCO ControllerConfig did not retain clone Infrastructure identity. "
+            "MCO ControllerConfig did not retain clone Infrastructure and DNS identity. "
             f"Log: {work}/clone.log")
-    _clone_log(work, "updated MCO ControllerConfig from clone Infrastructure identity")
+    _clone_log(work, "updated MCO ControllerConfig from clone Infrastructure and DNS identity")
 
 
 def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout_seconds=600):
     """Wait for the MCO-owned ControllerConfig to generate clone-specific 00-master."""
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
     api_vip = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
+    dns_result = env.run(
+        f"{clone_oc} get dns.config.openshift.io cluster -o json", check=False)
+    if dns_result.returncode != 0 or not (dns_result.stdout or "").strip():
+        sys.exit(
+            "Could not read DNS/cluster while waiting for clone-specific MCO inputs. "
+            f"Log: {work}/clone.log")
+    try:
+        expected_dns = json.loads(dns_result.stdout)
+    except json.JSONDecodeError:
+        sys.exit(f"DNS/cluster was not valid JSON. Log: {work}/clone.log")
+    if (expected_dns.get("spec") or {}).get("baseDomain") != domain:
+        sys.exit(
+            "DNS/cluster does not contain the clone base domain while waiting for MCO inputs. "
+            f"Log: {work}/clone.log")
     started = time.monotonic()
     deadline = started + timeout_seconds
     next_status_log = started + 30
@@ -3831,16 +4060,19 @@ def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout
         if (controller.returncode == 0 and machineconfig.returncode == 0
                 and (controller.stdout or "").strip()
                 and (machineconfig.stdout or "").strip()):
-            controller_ready = compact_controllerconfig_infra_matches(
+            controller_infra_ready = compact_controllerconfig_infra_matches(
                 controller.stdout, domain, api_vip, subnet)
-            machineconfig_ready = compact_machineconfig_input_has_clone_api_url(
+            controller_dns_ready = compact_controllerconfig_dns_matches(
+                controller.stdout, expected_dns, domain)
+            machineconfig_ready = compact_machineconfig_input_has_clone_identity(
                 machineconfig.stdout, domain)
-            if controller_ready and machineconfig_ready:
+            if controller_infra_ready and controller_dns_ready and machineconfig_ready:
                 _clone_log(work, "MCO ControllerConfig generated clone-specific 00-master")
                 return
             last_detail = (
-                f"ControllerConfig clone identity={'ready' if controller_ready else 'pending'}, "
-                f"00-master clone API URL={'ready' if machineconfig_ready else 'pending'}")
+                f"ControllerConfig Infrastructure={'ready' if controller_infra_ready else 'pending'}, "
+                f"DNS={'ready' if controller_dns_ready else 'pending'}, "
+                f"00-master clone API/CoreDNS identity={'ready' if machineconfig_ready else 'pending'}")
         else:
             errors = "; ".join(
                 detail for detail in (
@@ -3861,16 +4093,23 @@ def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout
         f"({last_detail}). Log: {work}/clone.log")
 
 
-def _wait_master_render(clone_oc, previous_render):
-    """Wait until the machine-config pool renders a new master config."""
+def _wait_master_render(clone_oc, previous_render, clone_domain, work):
+    """Wait for two observations of the same new render with complete clone identity."""
     if not previous_render:
         sys.exit("Cannot wait for a new master render without the previous MCP render name")
     render_oc = clone_oc.replace("--request-timeout=40s", "--request-timeout=5s")
     deadline = time.monotonic() + 180
     current_render = ""
     last_error = ""
+    last_candidate = ""
+    last_valid_render = ""
+    valid_observations = 0
+    last_logged_observation = None
+    last_identity_detail = "no new render observed"
+    next_status_log = time.monotonic() + 30
     # Certificate recovery runs in parallel. Keep failed API probes short while
-    # the static pods restart; a successful render still returns immediately.
+    # the static pods restart, and ignore intermediate renders that combine
+    # clone API identity with the source cluster's CoreDNS template.
     while time.monotonic() < deadline:
         result = env.run(
             f"{render_oc} get mcp master -o jsonpath='{{.spec.configuration.name}}'",
@@ -3878,13 +4117,66 @@ def _wait_master_render(clone_oc, previous_render):
         current_render = (result.stdout or "").strip()
         last_error = (result.stderr or "").strip()
         rendered = compact_new_rendered_master(previous_render, current_render)
-        if rendered:
-            return rendered
+        if not rendered:
+            last_candidate = ""
+            last_valid_render = ""
+            valid_observations = 0
+            if result.returncode != 0:
+                last_identity_detail = last_error or "MCP desired render unavailable"
+        else:
+            if rendered != last_candidate:
+                last_candidate = rendered
+                last_valid_render = ""
+                valid_observations = 0
+            candidate = env.run(
+                f"{render_oc} get machineconfig {shlex.quote(rendered)} -o json",
+                check=False)
+            if candidate.returncode != 0 or not (candidate.stdout or "").strip():
+                last_valid_render = ""
+                valid_observations = 0
+                last_identity_detail = (candidate.stderr or "").strip() or "render object unavailable"
+            else:
+                name, _api_url, identity_errors = _compact_machineconfig_identity(
+                    candidate.stdout, clone_domain)
+                if name != rendered:
+                    identity_errors.append(f"object name does not match MCP render {rendered}")
+                if identity_errors:
+                    last_valid_render = ""
+                    valid_observations = 0
+                    last_identity_detail = "; ".join(identity_errors)
+                else:
+                    last_identity_detail = "clone API and CoreDNS identity verified"
+                    if rendered == last_valid_render:
+                        valid_observations += 1
+                    else:
+                        last_valid_render = rendered
+                        valid_observations = 1
+                    if valid_observations >= 2:
+                        _clone_log(
+                            work,
+                            f"accepted stable clone-specific master render {rendered} "
+                            "after two identity checks")
+                        return rendered
+
+        observation = (rendered, last_identity_detail)
+        now = time.monotonic()
+        if observation != last_logged_observation or now >= next_status_log:
+            if rendered:
+                _clone_log(
+                    work,
+                    f"waiting for a stable clone-specific MCO render {rendered}: "
+                    f"{last_identity_detail}; valid-observations={valid_observations}/2")
+            elif result.returncode != 0:
+                _clone_log(work, f"waiting for MCO render: {last_identity_detail}")
+            last_logged_observation = observation
+            next_status_log = now + 30
         time.sleep(min(2, max(0, deadline - time.monotonic())))
     error_detail = f"; last error: {last_error}" if last_error else ""
     sys.exit(
-        "Timed out after 180 seconds waiting for a new master MachineConfig render "
-        f"(previous={previous_render}, current={current_render or 'unavailable'}"
+        "Timed out after 180 seconds waiting for a stable new master MachineConfig "
+        "render with complete clone API/CoreDNS identity "
+        f"(previous={previous_render}, current={current_render or 'unavailable'}, "
+        f"identity={last_identity_detail}"
         f"{error_detail}).")
 
 
@@ -4139,7 +4431,7 @@ def _finish_compact_clone(
                     "Could not apply clone Infrastructure identity before MCO render"
                     + (f": {detail}" if detail else "")
                     + f". Log: {work}/clone.log")
-        _sync_compact_controllerconfig_infra(clone_oc, clone_id, subnet, work)
+        _sync_compact_controllerconfig_identity(clone_oc, clone_id, subnet, work)
 
         _clone_log(work, "publish clone node addresses before MCO render")
         _publish_clone_addresses(clone_oc, nodes, pairs)
@@ -4168,7 +4460,7 @@ def _finish_compact_clone(
             check=False)
         if existing_render.returncode == 0 and (existing_render.stdout or "").strip():
             existing_render_raw = existing_render.stdout
-            existing_render_matches = compact_machineconfig_has_clone_api_url(
+            existing_render_matches = compact_machineconfig_has_clone_identity(
                 existing_render_raw, domain)
         if controllerconfig_owned:
             _clone_log(
@@ -4272,7 +4564,8 @@ def _finish_compact_clone(
                     work,
                     f"reusing clone-specific master render {previous_desired_render} on retry")
                 return previous_desired_render, existing_render_raw
-            rendered_name = _wait_master_render(clone_oc, previous_desired_render)
+            rendered_name = _wait_master_render(
+                clone_oc, previous_desired_render, domain, work)
             raw = env.run(
                 f"{clone_oc} get machineconfig {shlex.quote(rendered_name)} -o json", check=False)
             if raw.returncode != 0 or not (raw.stdout or "").strip():
@@ -4411,6 +4704,8 @@ def _finish_compact_clone(
     last_revision_sample = None
     last_mco_sample = None
     last_mco_node_sample = None
+    persistent_mcd_mismatch_signature = None
+    persistent_mcd_mismatch_since = None
     last_observe_signature = None
     endpoint_repair_failures = 0
     endpoint_detail = "not observed"
@@ -4472,6 +4767,36 @@ def _finish_compact_clone(
         )
         machine_config_ready, machine_config_detail, observed_master_render = (
             compact_machine_config_observation(watched["mcp"].stdout or "", parsed_nodes))
+        mismatched_mcd_nodes = [
+            observation for observation in mco_node_sample
+            if not observation.get("missing")
+            and observation.get("state") == "Degraded"
+            and "content mismatch for file" in observation.get("reason", "")
+        ]
+        if len(mismatched_mcd_nodes) == len(COMPACT_ROLES):
+            mismatch_signature = tuple(
+                (observation["role"], observation["reason"])
+                for observation in mismatched_mcd_nodes)
+            if mismatch_signature != persistent_mcd_mismatch_signature:
+                persistent_mcd_mismatch_signature = mismatch_signature
+                persistent_mcd_mismatch_since = time.monotonic()
+                _clone_log(
+                    work,
+                    "all three MCDs report rendered-file content mismatch; "
+                    "starting a five-minute persistence check")
+            mismatch_elapsed = time.monotonic() - persistent_mcd_mismatch_since
+            if mismatch_elapsed >= 300:
+                details = "; ".join(
+                    f"{observation['role']}: {observation['reason']}"
+                    for observation in mismatched_mcd_nodes)
+                sys.exit(
+                    "All three Machine Config Daemons have continuously reported "
+                    "rendered-file content mismatch for at least five minutes; "
+                    f"refusing to wait out the full install-readiness timeout ({details}). "
+                    f"Log: {work}/clone.log")
+        else:
+            persistent_mcd_mismatch_signature = None
+            persistent_mcd_mismatch_since = None
         endpoint_reads_valid, endpoint_read_detail = compact_kubernetes_endpoint_observation(
             watched["endpoints"], watched["endpoint-slice"])
         endpoint_ready = False
@@ -4550,12 +4875,19 @@ def _finish_compact_clone(
                 machine_config_ready = False
                 machine_config_detail += f" desired render {observed_master_render} unavailable"
             else:
-                desired_master_render, expected_api_url = compact_machineconfig_identity(
-                    current_render.stdout, domain)
-                if desired_master_render != observed_master_render:
-                    sys.exit(
-                        "MCP changed while reading its desired render "
-                        f"({observed_master_render} -> {desired_master_render}). Log: {work}/clone.log")
+                candidate_name, candidate_api_url, identity_errors = (
+                    _compact_machineconfig_identity(current_render.stdout, domain))
+                if candidate_name != observed_master_render:
+                    identity_errors.append(
+                        f"object name does not match MCP render {observed_master_render}")
+                if identity_errors:
+                    machine_config_ready = False
+                    machine_config_detail += (
+                        f" desired render {observed_master_render} has invalid clone identity: "
+                        + "; ".join(identity_errors))
+                else:
+                    desired_master_render = candidate_name
+                    expected_api_url = candidate_api_url
         last_mco_detail = machine_config_detail
         mco_sample = (machine_config_ready, machine_config_detail)
         if mco_sample != last_mco_sample:

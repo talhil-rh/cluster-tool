@@ -1597,7 +1597,7 @@ class TestCompactInspect(unittest.TestCase):
     def test_compact_mcd_pod_address_rows_read_host_network_identity_and_readiness(self):
         raw = json.dumps({"items": [
             {
-                "metadata": {"name": "machine-config-daemon-a"},
+                "metadata": {"name": "machine-config-daemon-a", "uid": "uid-a"},
                 "spec": {"nodeName": "master-0-0"},
                 "status": {"podIP": "192.168.200.69", "containerStatuses": [
                     {"ready": True}, {"ready": True},
@@ -1611,7 +1611,7 @@ class TestCompactInspect(unittest.TestCase):
                 ]},
             },
             {
-                "metadata": {"name": "machine-config-daemon-b"},
+                "metadata": {"name": "machine-config-daemon-b", "uid": "uid-b"},
                 "spec": {"nodeName": "master-0-2"},
                 "status": {"podIP": "192.168.123.50", "containerStatuses": [
                     {"ready": True}, {"ready": False},
@@ -1620,14 +1620,14 @@ class TestCompactInspect(unittest.TestCase):
         ]})
 
         self.assertEqual(ct.compact_mcd_pod_address_rows(raw), {
-            "master-0-0": {"name": "machine-config-daemon-a", "ip": "192.168.200.69", "ready": True},
-            "master-0-2": {"name": "machine-config-daemon-b", "ip": "192.168.123.50", "ready": False},
+            "master-0-0": {"name": "machine-config-daemon-a", "uid": "uid-a", "ip": "192.168.200.69", "ready": True},
+            "master-0-2": {"name": "machine-config-daemon-b", "uid": "uid-b", "ip": "192.168.123.50", "ready": False},
         })
 
     def test_compact_mcd_address_recovery_replaces_stale_daemonset_pod(self):
-        def pod(name, node, ip, ready=True):
+        def pod(name, uid, node, ip, ready=True):
             return json.dumps({"items": [{
-                "metadata": {"name": name},
+                "metadata": {"name": name, "uid": uid},
                 "spec": {"nodeName": node},
                 "status": {"podIP": ip, "containerStatuses": [{"ready": ready}]},
             }]})
@@ -1641,23 +1641,93 @@ class TestCompactInspect(unittest.TestCase):
 
         env = MagicMock()
         env.run.side_effect = [
-            result(pod("machine-config-daemon-old", "master-0-0", "192.168.123.64")),
+            result(pod("machine-config-daemon-old", "old-uid", "master-0-0", "192.168.123.64")),
             result(),
-            result(pod("machine-config-daemon-new", "master-0-0", "192.168.200.69")),
-            result(pod("machine-config-daemon-master-1", "master-0-1", "192.168.200.81")),
+            result(pod("machine-config-daemon-new", "new-uid", "master-0-0", "192.168.200.69")),
+            result(pod("machine-config-daemon-master-1", "master-1-uid", "master-0-1", "192.168.200.81")),
         ]
         nodes = [
             {"role": "master-0-0", "ip": "192.168.200.69"},
             {"role": "master-0-1", "ip": "192.168.200.81"},
         ]
-        with patch.object(ct, "env", env), patch.object(ct, "_clone_log"):
+        with patch.object(ct, "env", env), patch.object(ct, "_clone_log"), \
+                patch.object(ct.time, "sleep"):
             ct._ensure_compact_mcd_pod_addresses("oc", nodes, "/work")
 
         self.assertIn(
-            "delete pod machine-config-daemon-old -n openshift-machine-config-operator --wait=false",
+            "/api/v1/namespaces/openshift-machine-config-operator/pods/machine-config-daemon-old",
+            env.run.call_args_list[1].args[0],
+        )
+        self.assertIn(
+            "--data-binary '{\"apiVersion\":\"v1\",\"kind\":\"DeleteOptions\","
+            "\"preconditions\":{\"uid\":\"old-uid\"}}'",
             env.run.call_args_list[1].args[0],
         )
         self.assertFalse(any("systemctl restart kubelet" in call.args[0]
+                             for call in env.run.call_args_list))
+
+    def test_compact_mcd_waits_for_correct_ip_pod_to_become_ready(self):
+        def pods(name, uid, node, ip, ready):
+            return json.dumps({"items": [{
+                "metadata": {"name": name, "uid": uid},
+                "spec": {"nodeName": node},
+                "status": {"podIP": ip, "containerStatuses": [{"ready": ready}]},
+            }]})
+
+        def result(stdout="", returncode=0, stderr=""):
+            return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+        env = MagicMock()
+        env.run.side_effect = [
+            result(pods("machine-config-daemon-stale", "stale-uid", "master-0-0", "192.168.123.64", True)),
+            result(),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", False)),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", False)),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", True)),
+            result(pods("machine-config-daemon-master-1", "master-1-uid", "master-0-1", "192.168.200.81", True)),
+        ]
+        nodes = [
+            {"role": "master-0-0", "ip": "192.168.200.69"},
+            {"role": "master-0-1", "ip": "192.168.200.81"},
+        ]
+        with patch.object(ct, "env", env), patch.object(ct, "_clone_log"), \
+                patch.object(ct.time, "sleep"):
+            ct._ensure_compact_mcd_pod_addresses("oc", nodes, "/work")
+
+        delete_calls = [call.args[0] for call in env.run.call_args_list
+                        if "KUBE_DELETE_HTTP_STATUS" in call.args[0]]
+        self.assertEqual(len(delete_calls), 1)
+        self.assertIn("pods/machine-config-daemon-stale", delete_calls[0])
+        self.assertIn('"preconditions":{"uid":"stale-uid"}', delete_calls[0])
+
+    def test_compact_mcd_does_not_delete_pod_before_it_has_an_ip(self):
+        def pods(name, uid, node, ip, ready):
+            return json.dumps({"items": [{
+                "metadata": {"name": name, "uid": uid},
+                "spec": {"nodeName": node},
+                "status": {"podIP": ip, "containerStatuses": [{"ready": ready}]},
+            }]})
+
+        def result(stdout=""):
+            return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+        env = MagicMock()
+        env.run.side_effect = [
+            result(pods("machine-config-daemon-pending", "pending-uid", "master-0-0", "", False)),
+            result(pods("machine-config-daemon-pending", "pending-uid", "master-0-0", "", False)),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", False)),
+            result(pods("machine-config-daemon-current", "current-uid", "master-0-0", "192.168.200.69", True)),
+            result(pods("machine-config-daemon-master-1", "master-1-uid", "master-0-1", "192.168.200.81", True)),
+        ]
+        nodes = [
+            {"role": "master-0-0", "ip": "192.168.200.69"},
+            {"role": "master-0-1", "ip": "192.168.200.81"},
+        ]
+        with patch.object(ct, "env", env), patch.object(ct, "_clone_log"), \
+                patch.object(ct.time, "sleep"):
+            ct._ensure_compact_mcd_pod_addresses("oc", nodes, "/work")
+
+        self.assertFalse(any("KUBE_DELETE_HTTP_STATUS" in call.args[0]
                              for call in env.run.call_args_list))
 
     def test_api_recovery_refreshes_host_ips_and_stale_leases_before_endpoints(self):
@@ -1896,10 +1966,37 @@ class TestCompactInspect(unittest.TestCase):
             ct.COMPACT_MCO_CONTROLLER_LEASE,
             ("openshift-machine-config-operator", "machine-config-controller"))
 
+    def test_compact_lease_delete_preconditions_require_uid_and_resource_version(self):
+        lease = {"metadata": {"uid": "lease-uid", "resourceVersion": "17"}}
+        self.assertEqual(ct.compact_lease_delete_preconditions(lease), {
+            "uid": "lease-uid", "resourceVersion": "17",
+        })
+        self.assertIsNone(ct.compact_lease_delete_preconditions({"metadata": {"uid": "lease-uid"}}))
+        self.assertIsNone(ct.compact_lease_delete_preconditions("not-json"))
+
+    def test_conditional_delete_script_sends_uid_and_resource_version_to_api(self):
+        script = ct.compact_kubernetes_delete_proxy_script(
+            "KUBECONFIG=/tmp/clone.kubeconfig oc --server=https://192.168.220.5:6443",
+            "/apis/coordination.k8s.io/v1/namespaces/openshift-machine-config-operator/leases/machine-config-controller",
+            {"uid": "lease-uid", "resourceVersion": "17"},
+        )
+        self.assertIn("proxy --address=127.0.0.1 --port=0", script)
+        self.assertIn("--request DELETE", script)
+        self.assertIn(
+            "--data-binary '{\"apiVersion\":\"v1\",\"kind\":\"DeleteOptions\","
+            "\"preconditions\":{\"uid\":\"lease-uid\",\"resourceVersion\":\"17\"}}'",
+            script,
+        )
+        with self.assertRaises(ValueError):
+            ct.compact_kubernetes_delete_proxy_script(
+                "oc", "/apis/apps/v1/namespaces/ns/deployments/name",
+                {"uid": "lease-uid"})
+
     def test_compact_mco_lease_cleanup_deletes_only_expired_leases(self):
         old_renew_time = (
             ct.datetime.now(ct.timezone.utc) - ct.timedelta(days=1)).isoformat()
         expired = json.dumps({
+            "metadata": {"uid": "lease-uid", "resourceVersion": "17"},
             "spec": {
                 "holderIdentity": "source-controller",
                 "renewTime": old_renew_time,
@@ -1920,10 +2017,77 @@ class TestCompactInspect(unittest.TestCase):
             ct._clear_expired_mco_controller_lease("oc --kubeconfig=clone.kubeconfig", "/work")
 
         self.assertEqual(mock_env.run.call_count, 3)
-        self.assertIn(
-            "delete lease machine-config-controller", mock_env.run.call_args_list[1].args[0])
-        self.assertIn("--ignore-not-found", mock_env.run.call_args_list[1].args[0])
+        delete_command = mock_env.run.call_args_list[1].args[0]
+        self.assertIn("/leases/machine-config-controller", delete_command)
+        self.assertIn('"preconditions":{"uid":"lease-uid","resourceVersion":"17"}',
+                      delete_command)
+        self.assertIn("--request DELETE", delete_command)
         self.assertIn("verified removal", clone_log.call_args.args[1])
+
+    def test_expired_mco_lease_cleanup_preserves_lease_renewed_after_conflict(self):
+        old_renew_time = (
+            ct.datetime.now(ct.timezone.utc) - ct.timedelta(days=1)).isoformat()
+        renewed_time = ct.datetime.now(ct.timezone.utc).isoformat()
+        expired = json.dumps({
+            "metadata": {"uid": "lease-uid", "resourceVersion": "17"},
+            "spec": {
+                "holderIdentity": "old-holder",
+                "renewTime": old_renew_time,
+                "leaseDurationSeconds": 137,
+            },
+        })
+        renewed = json.dumps({
+            "metadata": {"uid": "lease-uid", "resourceVersion": "18"},
+            "spec": {
+                "holderIdentity": "active-holder",
+                "renewTime": renewed_time,
+                "leaseDurationSeconds": 137,
+            },
+        })
+        mock_env = MagicMock()
+        mock_env.run.side_effect = [
+            MagicMock(returncode=0, stdout=expired, stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="Error from server (Conflict)"),
+            MagicMock(returncode=0, stdout=renewed, stderr=""),
+        ]
+        with patch.object(ct, "env", mock_env), patch.object(ct, "_clone_log") as clone_log:
+            ct._clear_expired_mco_controller_lease("oc", "/work")
+
+        self.assertEqual(mock_env.run.call_count, 3)
+        self.assertIn('"preconditions":{"uid":"lease-uid","resourceVersion":"17"}',
+                      mock_env.run.call_args_list[1].args[0])
+        self.assertIn("renewed during cleanup", clone_log.call_args.args[1])
+
+    def test_expired_mco_lease_cleanup_preserves_replacement_after_conflict(self):
+        old_renew_time = (
+            ct.datetime.now(ct.timezone.utc) - ct.timedelta(days=1)).isoformat()
+        expired = json.dumps({
+            "metadata": {"uid": "old-uid", "resourceVersion": "17"},
+            "spec": {
+                "holderIdentity": "old-holder",
+                "renewTime": old_renew_time,
+                "leaseDurationSeconds": 137,
+            },
+        })
+        replaced = json.dumps({
+            "metadata": {"uid": "new-uid", "resourceVersion": "1"},
+            "spec": {
+                "holderIdentity": "new-holder",
+                "renewTime": old_renew_time,
+                "leaseDurationSeconds": 137,
+            },
+        })
+        mock_env = MagicMock()
+        mock_env.run.side_effect = [
+            MagicMock(returncode=0, stdout=expired, stderr=""),
+            MagicMock(returncode=1, stdout="", stderr="Error from server (Conflict)"),
+            MagicMock(returncode=0, stdout=replaced, stderr=""),
+        ]
+        with patch.object(ct, "env", mock_env), patch.object(ct, "_clone_log") as clone_log:
+            ct._clear_expired_mco_controller_lease("oc", "/work")
+
+        self.assertEqual(mock_env.run.call_count, 3)
+        self.assertIn("preserving replacement", clone_log.call_args.args[1])
 
     def test_compact_finish_clears_expired_mco_lease_before_mco_render(self):
         source = inspect.getsource(ct._finish_compact_clone)
