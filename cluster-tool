@@ -2126,6 +2126,14 @@ def _presented_san(ip, servername):
     return raw.stdout or ""
 
 
+def _certificate_file_has_san(path, hostname):
+    """Check one certificate file for a hostname without printing its key."""
+    result = env.run(
+        f"openssl x509 -in {shlex.quote(path)} -noout -ext subjectAltName",
+        check=False)
+    return result.returncode == 0 and hostname in (result.stdout or "")
+
+
 def _push_lb_cert(identity, nodes, work, secret):
     """Copy a load-balancer certificate onto each compact node."""
     src = f"{work}/lb-{secret}"
@@ -2178,9 +2186,20 @@ def _ensure_api_certificates(oc, work, domain, api_ip, nodes, identity):
         "internal-loadbalancer-serving-certkey": f"api-int.{domain}",
         "external-loadbalancer-serving-certkey": f"api.{domain}",
     }
-    # The running controller still has the source API name cached, so waiting
-    # for it to notice the clone name only delays the manual signature.
-    if not all(wanted[name] in _secret_hostnames(oc, name) for name in wanted):
+    # Secret annotations can already name the clone while an interrupted copy
+    # left one or more nodes with the source certificate. Validate the actual
+    # certificate, then always distribute the authoritative secret to every node.
+    secret_certs_ok = {}
+    for secret, hostname in wanted.items():
+        cert_dir = f"{work}/lb-{secret}"
+        env.run(f"mkdir -p {shlex.quote(cert_dir)} && chmod 700 {shlex.quote(cert_dir)}")
+        check_cert = f"{cert_dir}/secret-check.crt"
+        _extract_secret(oc, "openshift-kube-apiserver", secret, "tls.crt", check_cert)
+        secret_certs_ok[secret] = (
+            hostname in _secret_hostnames(oc, secret)
+            and _certificate_file_has_san(check_cert, hostname))
+
+    if not all(secret_certs_ok.values()):
         _clone_log(work, "signing API serving certificates with the load balancer signer")
         signer = f"{work}/lb-signer"
         env.run(f"mkdir -p {shlex.quote(signer)} && chmod 700 {shlex.quote(signer)}")
@@ -2188,21 +2207,44 @@ def _ensure_api_certificates(oc, work, domain, api_ip, nodes, identity):
         _extract_secret(oc, "openshift-kube-apiserver-operator", "loadbalancer-serving-signer", "tls.key", f"{signer}/tls.key")
         for secret, hostname in wanted.items():
             _install_lb_serving_cert(oc, work, secret, hostname, api_ip, signer)
-            _push_lb_cert(identity, nodes, work, secret)
-    for _ in range(6):
-        if presented_san_matches(
-            _presented_san(api_ip, wanted["internal-loadbalancer-serving-certkey"]),
-            wanted["internal-loadbalancer-serving-certkey"],
-        ):
-            _clone_log(work, "API certificates present for clone names")
-            return
-        for node in nodes:
-            _vm(node["ip"], compact_reload_apiserver_script(), identity, check=False)
-        time.sleep(15)
-    sys.exit(
-        f"The API server is not presenting the clone internal name "
-        f"{wanted['internal-loadbalancer-serving-certkey']}; kubelets cannot trust the API. "
-        f"Log: {work}/clone.log")
+
+    for secret, hostname in wanted.items():
+        cert_dir = f"{work}/lb-{secret}"
+        cert_path = f"{cert_dir}/tls.crt"
+        key_path = f"{cert_dir}/tls.key"
+        if secret_certs_ok[secret]:
+            _extract_secret(oc, "openshift-kube-apiserver", secret, "tls.crt", cert_path)
+            _extract_secret(oc, "openshift-kube-apiserver", secret, "tls.key", key_path)
+        # When signing was needed, _install_lb_serving_cert staged the fresh pair.
+        if not _certificate_file_has_san(cert_path, hostname):
+            sys.exit(f"The staged API certificate is missing {hostname}; log: {work}/clone.log")
+        _push_lb_cert(identity, nodes, work, secret)
+
+    def node_has_clone_certs(node):
+        return all(
+            presented_san_matches(_presented_san(node["ip"], hostname), hostname)
+            for hostname in wanted.values())
+
+    needs_reload = [node for node in nodes if not node_has_clone_certs(node)]
+    if needs_reload:
+        roles = ",".join(node["role"] for node in needs_reload)
+        _clone_log(work, f"reload API static pods once to load clone certificates on {roles}")
+        _in_parallel(
+            needs_reload,
+            lambda node: _vm(node["ip"], compact_reload_apiserver_script(), identity, check=False),
+        )
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            ready = _in_parallel_results(needs_reload, node_has_clone_certs)
+            if all(ready):
+                break
+            time.sleep(5)
+        else:
+            missing = [node["role"] for node, ready in zip(needs_reload, ready) if not ready]
+            sys.exit(
+                "API servers did not load clone serving certificates on "
+                f"{','.join(missing)}. Kubelets cannot trust the API. Log: {work}/clone.log")
+    _clone_log(work, "API certificates present for clone names on all nodes")
 
 
 def _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity):
@@ -2909,21 +2951,22 @@ def _wait_master_render(clone_oc, previous_render):
     """Wait until the machine-config pool renders a new master config."""
     if not previous_render:
         sys.exit("Cannot wait for a new master render without the previous MCP render name")
+    render_oc = clone_oc.replace("--request-timeout=40s", "--request-timeout=5s")
+    deadline = time.monotonic() + 180
     current_render = ""
     last_error = ""
-    # A fresh API certificate can take up to 90 seconds to propagate and reload.
-    # Allow MCO more time to reconnect and render in parallel; the common case
-    # still returns immediately when the new render appears.
-    for _ in range(90):
+    # Certificate recovery runs in parallel. Keep failed API probes short while
+    # the static pods restart; a successful render still returns immediately.
+    while time.monotonic() < deadline:
         result = env.run(
-            f"{clone_oc} get mcp master -o jsonpath='{{.spec.configuration.name}}'",
+            f"{render_oc} get mcp master -o jsonpath='{{.spec.configuration.name}}'",
             check=False)
         current_render = (result.stdout or "").strip()
         last_error = (result.stderr or "").strip()
         rendered = compact_new_rendered_master(previous_render, current_render)
         if rendered:
             return rendered
-        time.sleep(2)
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
     error_detail = f"; last error: {last_error}" if last_error else ""
     sys.exit(
         "Timed out after 180 seconds waiting for a new master MachineConfig render "
