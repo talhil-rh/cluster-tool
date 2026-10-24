@@ -2466,6 +2466,69 @@ class TestCompactInspect(unittest.TestCase):
         self.assertLess(recovery.index("_ensure_api_certificates"), recovery.index("_refresh_internal_api_certificate"))
         self.assertNotIn("time.sleep(30)", finish)
 
+    def test_kube_apiserver_install_readiness_uses_each_advanced_node(self):
+        rolling_but_available = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 1 node is at revision 8; 2 nodes are at revision 9"},
+            {"type": "Available", "status": "True",
+             "message": "StaticPodsAvailable: 3 nodes are active; 1 node is at revision 8; 2 nodes are at revision 9"},
+            {"type": "Degraded", "status": "False"},
+        ]}}
+        self.assertTrue(ct.compact_static_pod_nodes_newer_than(rolling_but_available, 5))
+        self.assertTrue(ct.compact_kube_apiserver_nodes_ready_for_install(rolling_but_available, 5))
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(rolling_but_available, 8))
+
+        status_report = {"status": {
+            "nodeStatuses": [
+                {"nodeName": "master-0-0", "currentRevision": 8, "targetRevision": 9},
+                {"nodeName": "master-0-1", "currentRevision": 9, "targetRevision": 0},
+                {"nodeName": "master-0-2", "currentRevision": 9, "targetRevision": 0},
+            ],
+            "conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Degraded", "status": "False"},
+            ],
+        }}
+        self.assertTrue(ct.compact_kube_apiserver_nodes_ready_for_install(status_report, 5))
+
+        wrong_nodes = {"status": {
+            "nodeStatuses": [
+                {"nodeName": "source-master-0-0", "currentRevision": 9},
+                {"nodeName": "source-master-0-1", "currentRevision": 9},
+                {"nodeName": "source-master-0-2", "currentRevision": 9},
+            ],
+            "conditions": [
+                {"type": "Available", "status": "True"},
+                {"type": "Degraded", "status": "False"},
+            ],
+        }}
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(wrong_nodes, 5))
+
+        one_node_still_on_baseline = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 1 node is at revision 5; 1 node is at revision 8; 1 node is at revision 9"},
+            {"type": "Available", "status": "True"},
+            {"type": "Degraded", "status": "False"},
+        ]}}
+        self.assertFalse(ct.compact_static_pod_nodes_newer_than(one_node_still_on_baseline, 5))
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(one_node_still_on_baseline, 5))
+
+        unavailable = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 1 node is at revision 8; 2 nodes are at revision 9"},
+            {"type": "Available", "status": "False"},
+            {"type": "Degraded", "status": "False"},
+        ]}}
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(unavailable, 5))
+
+        degraded = {"status": {"conditions": [
+            {"type": "Progressing", "status": "True",
+             "message": "NodeInstallerProgressing: 1 node is at revision 8; 2 nodes are at revision 9"},
+            {"type": "Available", "status": "True"},
+            {"type": "Degraded", "status": "True"},
+        ]}}
+        self.assertFalse(ct.compact_kube_apiserver_nodes_ready_for_install(degraded, 5))
+
     def test_health_resume_requires_saved_revision_baselines(self):
         self.assertIsNone(ct.compact_valid_revision_baselines(None))
         self.assertIsNone(ct.compact_valid_revision_baselines({"etcd": 10}))

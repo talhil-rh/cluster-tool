@@ -4827,17 +4827,27 @@ def _finish_compact_clone(
                 "refresh machine-config-daemon host addresses after all clone nodes are Ready")
             _ensure_compact_mcd_pod_addresses(clone_oc, nodes, work)
             mcd_addresses_verified = True
+        etcd_revision = compact_static_pod_revision(docs.get("etcd"))
+        apiserver_revision = compact_static_pod_revision(docs.get("kube-apiserver"))
+        apiserver_nodes_newer = compact_static_pod_nodes_newer_than(
+            docs.get("kube-apiserver"), apiserver_revision_baseline)
+        apiserver_progress_allowed = compact_kube_apiserver_nodes_ready_for_install(
+            docs.get("kube-apiserver"), apiserver_revision_baseline)
         unhealthy = [
             op["name"] for op in operators
             if op.get("available") != "True" or op.get("progressing") != "False" or op.get("degraded") != "False"
         ]
+        if apiserver_progress_allowed:
+            # A rolling latest revision is safe to finish in the background once
+            # each master already serves a revision newer than the saved flavor
+            # baseline. Availability, degradation, per-node revision, and API
+            # endpoint checks remain part of the install-ready gate.
+            unhealthy = [name for name in unhealthy if name != "kube-apiserver"]
         core_unhealthy, post_unhealthy = compact_split_operators(unhealthy)
         install_blockers = compact_install_blockers(unhealthy)
-        etcd_revision = compact_static_pod_revision(docs.get("etcd"))
-        apiserver_revision = compact_static_pod_revision(docs.get("kube-apiserver"))
         revisions_ready = (
             compact_static_pod_rollout_ready(etcd_revision, etcd_revision_baseline)
-            and compact_static_pod_rollout_ready(apiserver_revision, apiserver_revision_baseline)
+            and apiserver_progress_allowed
         )
         machine_config_ready, machine_config_detail, observed_master_render = (
             compact_machine_config_observation(watched["mcp"].stdout or "", parsed_nodes))
@@ -4974,6 +4984,7 @@ def _finish_compact_clone(
         revision_sample = (
             etcd_revision.get("latest"), etcd_revision.get("converged"),
             apiserver_revision.get("latest"), apiserver_revision.get("converged"),
+            apiserver_nodes_newer,
         )
         if revision_sample != last_revision_sample:
             _clone_log(
@@ -4981,7 +4992,9 @@ def _finish_compact_clone(
                 f"install revisions etcd={etcd_revision.get('latest')}/{etcd_revision_baseline} "
                 f"converged={etcd_revision.get('converged')} "
                 f"kube-apiserver={apiserver_revision.get('latest')}/{apiserver_revision_baseline} "
-                f"converged={apiserver_revision.get('converged')}")
+                f"converged={apiserver_revision.get('converged')} "
+                f"all-nodes-newer={apiserver_nodes_newer} "
+                f"install-available={apiserver_progress_allowed}")
             last_revision_sample = revision_sample
         if core_unhealthy or install_blockers:
             blocker = compact_core_blocker_text(json.dumps({
@@ -5775,6 +5788,75 @@ def compact_static_pod_revision(operator_doc):
         if condition.get("type") in ("Progressing", "Available")
     ]
     return compact_revision_from_text(" ".join(messages))
+
+
+def compact_static_pod_nodes_newer_than(operator_doc, baseline):
+    """Return whether every compact master serves a revision newer than baseline."""
+    if not _revision_int(baseline):
+        return False
+    status = (operator_doc or {}).get("status") or {}
+    nodes = status.get("nodeStatuses") or []
+    current_revisions = []
+    if nodes:
+        by_name = {
+            node.get("nodeName"): node.get("currentRevision")
+            for node in nodes if isinstance(node, dict)
+        }
+        named_nodes = any(node.get("nodeName") for node in nodes if isinstance(node, dict))
+        if named_nodes and all(role in by_name for role in COMPACT_ROLES):
+            current_revisions = [by_name[role] for role in COMPACT_ROLES]
+        elif not named_nodes and len(nodes) == len(COMPACT_ROLES):
+            current_revisions = [
+                node.get("currentRevision") if isinstance(node, dict) else None
+                for node in nodes
+            ]
+    else:
+        conditions = {
+            condition.get("type"): condition.get("message") or ""
+            for condition in status.get("conditions") or []
+            if isinstance(condition, dict)
+        }
+        # ClusterOperator status is the available source on OpenShift 4.22.
+        # Prefer Progressing because it names current and pending revisions;
+        # Available is a fallback for versions with less detailed messages.
+        for condition_type in ("Progressing", "Available"):
+            totals = {}
+            seen = set()
+            for match in re.finditer(
+                r"(\d+) nodes? (are at revision|is at revision|have achieved new revision) (\d+)",
+                conditions.get(condition_type, ""),
+                re.I,
+            ):
+                count, kind, revision = int(match.group(1)), match.group(2).lower(), int(match.group(3))
+                if "achieved" in kind:
+                    continue
+                token = (count, revision)
+                if token in seen:
+                    continue
+                seen.add(token)
+                totals[revision] = totals.get(revision, 0) + count
+            if sum(totals.values()) == len(COMPACT_ROLES):
+                current_revisions = [
+                    revision for revision, count in sorted(totals.items())
+                    for _ in range(count)
+                ]
+                break
+    return (
+        len(current_revisions) == len(COMPACT_ROLES)
+        and all(_revision_int(revision) and revision > baseline for revision in current_revisions)
+    )
+
+
+def compact_kube_apiserver_nodes_ready_for_install(operator_doc, baseline):
+    """Allow a remaining API revision rollout only with all serving masters advanced."""
+    if not compact_static_pod_nodes_newer_than(operator_doc, baseline):
+        return False
+    conditions = {
+        condition.get("type"): condition.get("status")
+        for condition in ((operator_doc or {}).get("status") or {}).get("conditions") or []
+        if isinstance(condition, dict)
+    }
+    return conditions.get("Available") == "True" and conditions.get("Degraded") == "False"
 
 
 def compact_static_pod_rollout_ready(revision, baseline):
