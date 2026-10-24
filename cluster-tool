@@ -2295,6 +2295,7 @@ def compact_mcd_pod_address_rows(raw):
             continue
         statuses = (pod.get("status") or {}).get("containerStatuses") or []
         rows[role] = {
+            "name": name,
             "ip": (pod.get("status") or {}).get("podIP") or "",
             "ready": bool(statuses) and all(item.get("ready") is True for item in statuses),
         }
@@ -2634,7 +2635,7 @@ def _recover_compact_api_certificates(oc, work, domain, api_ip, nodes, identity)
     _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity)
 
 
-def _ensure_compact_mcd_pod_addresses(clone_oc, nodes, identity, work):
+def _ensure_compact_mcd_pod_addresses(clone_oc, nodes, work):
     """Refresh host-network MCD pods that retained source-node addresses."""
     _clone_log(work, "verify machine-config-daemon host addresses match clone nodes")
 
@@ -2654,25 +2655,48 @@ def _ensure_compact_mcd_pod_addresses(clone_oc, nodes, identity, work):
             _clone_log(work, f"machine-config-daemon on {node['role']} already uses clone IP {node['ip']}")
             continue
 
-        _clone_log(work, f"restart {node['role']} kubelet to refresh its host-network pod IP")
-        restarted = _vm(node["ip"], "sudo systemctl restart kubelet", identity, check=False)
-        if restarted.returncode != 0:
-            detail = (restarted.stderr or restarted.stdout or "kubelet restart failed").strip()
-            sys.exit(
-                f"Could not refresh host-network pods on {node['role']}: {detail}. "
-                f"Log: {work}/clone.log")
-
         deadline = time.monotonic() + 120
+        deleted_pods = set()
         while time.monotonic() < deadline:
-            state = observe(node["role"])
             if state and state["ip"] == node["ip"] and state["ready"]:
                 _clone_log(work, f"machine-config-daemon on {node['role']} uses clone IP {node['ip']}")
                 break
+            pod_name = (state or {}).get("name")
+            if pod_name and pod_name not in deleted_pods:
+                if len(deleted_pods) >= 3:
+                    break
+                _clone_log(
+                    work,
+                    f"replace stale machine-config-daemon pod {pod_name} on {node['role']} "
+                    f"(pod IP={(state or {}).get('ip') or 'pending'})")
+                deleted = env.run(
+                    f"{clone_oc} delete pod {shlex.quote(pod_name)} "
+                    "-n openshift-machine-config-operator --wait=false",
+                    check=False)
+                if deleted.returncode != 0:
+                    latest = observe(node["role"])
+                    if latest and latest["ip"] == node["ip"] and latest["ready"]:
+                        state = latest
+                        _clone_log(
+                            work,
+                            f"machine-config-daemon on {node['role']} uses clone IP {node['ip']}")
+                        break
+                    detail = (deleted.stderr or deleted.stdout or "pod deletion failed").strip()
+                    sys.exit(
+                        f"Could not replace stale machine-config-daemon pod on {node['role']}: "
+                        f"{detail}. Log: {work}/clone.log")
+                deleted_pods.add(pod_name)
             time.sleep(2)
+            state = observe(node["role"])
         else:
             sys.exit(
                 f"machine-config-daemon on {node['role']} did not become Ready with clone IP "
-                f"{node['ip']}. Log: {work}/clone.log")
+                f"{node['ip']} after replacing stale pods {sorted(deleted_pods)}. "
+                f"Log: {work}/clone.log")
+        if not (state and state["ip"] == node["ip"] and state["ready"]):
+            sys.exit(
+                f"machine-config-daemon on {node['role']} kept a stale host-network address "
+                f"after replacing pods {sorted(deleted_pods)}. Log: {work}/clone.log")
 
 
 def _ensure_compact_apiserver_host_ips(nodes, identity, work):
@@ -2695,7 +2719,7 @@ def _recover_compact_api_certificates_and_endpoints(
 ):
     """Refresh API certs and lease-backed endpoints before MCO waits on the API service."""
     _recover_compact_api_certificates(clone_oc, work, domain, api_ip, nodes, identity)
-    _ensure_compact_mcd_pod_addresses(clone_oc, nodes, identity, work)
+    _ensure_compact_mcd_pod_addresses(clone_oc, nodes, work)
     _ensure_compact_apiserver_host_ips(nodes, identity, work)
     _clear_compact_stale_master_leases(nodes, identity, etcd_image, work)
     if _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work) is not True:

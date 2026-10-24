@@ -1620,9 +1620,45 @@ class TestCompactInspect(unittest.TestCase):
         ]})
 
         self.assertEqual(ct.compact_mcd_pod_address_rows(raw), {
-            "master-0-0": {"ip": "192.168.200.69", "ready": True},
-            "master-0-2": {"ip": "192.168.123.50", "ready": False},
+            "master-0-0": {"name": "machine-config-daemon-a", "ip": "192.168.200.69", "ready": True},
+            "master-0-2": {"name": "machine-config-daemon-b", "ip": "192.168.123.50", "ready": False},
         })
+
+    def test_compact_mcd_address_recovery_replaces_stale_daemonset_pod(self):
+        def pod(name, node, ip, ready=True):
+            return json.dumps({"items": [{
+                "metadata": {"name": name},
+                "spec": {"nodeName": node},
+                "status": {"podIP": ip, "containerStatuses": [{"ready": ready}]},
+            }]})
+
+        def result(stdout="", returncode=0, stderr=""):
+            value = MagicMock()
+            value.stdout = stdout
+            value.stderr = stderr
+            value.returncode = returncode
+            return value
+
+        env = MagicMock()
+        env.run.side_effect = [
+            result(pod("machine-config-daemon-old", "master-0-0", "192.168.123.64")),
+            result(),
+            result(pod("machine-config-daemon-new", "master-0-0", "192.168.200.69")),
+            result(pod("machine-config-daemon-master-1", "master-0-1", "192.168.200.81")),
+        ]
+        nodes = [
+            {"role": "master-0-0", "ip": "192.168.200.69"},
+            {"role": "master-0-1", "ip": "192.168.200.81"},
+        ]
+        with patch.object(ct, "env", env), patch.object(ct, "_clone_log"):
+            ct._ensure_compact_mcd_pod_addresses("oc", nodes, "/work")
+
+        self.assertIn(
+            "delete pod machine-config-daemon-old -n openshift-machine-config-operator --wait=false",
+            env.run.call_args_list[1].args[0],
+        )
+        self.assertFalse(any("systemctl restart kubelet" in call.args[0]
+                             for call in env.run.call_args_list))
 
     def test_api_recovery_refreshes_host_ips_and_stale_leases_before_endpoints(self):
         source = inspect.getsource(ct._recover_compact_api_certificates_and_endpoints)
