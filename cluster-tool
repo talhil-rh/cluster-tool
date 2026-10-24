@@ -3495,11 +3495,13 @@ def _sync_compact_controllerconfig_infra(clone_oc, clone_id, subnet, work):
     _clone_log(work, "updated MCO ControllerConfig from clone Infrastructure identity")
 
 
-def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout_seconds=180):
+def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout_seconds=600):
     """Wait for the MCO-owned ControllerConfig to generate clone-specific 00-master."""
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
     api_vip = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
-    deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    next_status_log = started + 30
     last_detail = "MCO source objects were not readable"
     while time.monotonic() < deadline:
         controller = env.run(
@@ -3526,7 +3528,14 @@ def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout
                     (machineconfig.stderr or "").strip(),
                 ) if detail)
             last_detail = errors or "MCO source objects were not readable"
-        time.sleep(min(2, max(0, deadline - time.monotonic())))
+        now = time.monotonic()
+        if now >= next_status_log:
+            _clone_log(
+                work,
+                "waiting for clone-specific MCO inputs "
+                f"(elapsed={int(now - started)}s; {last_detail})")
+            next_status_log = now + 30
+        time.sleep(min(2, max(0, deadline - now)))
     sys.exit(
         f"Timed out after {timeout_seconds} seconds waiting for clone-specific MCO inputs "
         f"({last_detail}). Log: {work}/clone.log")
