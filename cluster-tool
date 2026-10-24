@@ -4030,6 +4030,69 @@ def _sync_compact_controllerconfig_identity(clone_oc, clone_id, subnet, work):
     _clone_log(work, "updated MCO ControllerConfig from clone Infrastructure and DNS identity")
 
 
+def _reschedule_compact_mco_controller_from_unready_node(clone_oc, work, attempted_uids):
+    """Move the MCO controller off a NotReady node so it can render the clone config."""
+    pods_result = env.run(
+        f"{clone_oc} get pods -n openshift-machine-config-operator "
+        "-l k8s-app=machine-config-controller -o json", check=False)
+    nodes_result = env.run(f"{clone_oc} get nodes -o json", check=False)
+    if (pods_result.returncode != 0 or nodes_result.returncode != 0
+            or not (pods_result.stdout or "").strip()
+            or not (nodes_result.stdout or "").strip()):
+        return
+    try:
+        pods = json.loads(pods_result.stdout).get("items", [])
+        nodes = json.loads(nodes_result.stdout).get("items", [])
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return
+
+    node_ready = {}
+    for node in nodes:
+        name = (node.get("metadata") or {}).get("name")
+        ready = next((condition for condition in (node.get("status") or {}).get("conditions", [])
+                      if condition.get("type") == "Ready"), {})
+        if name:
+            node_ready[name] = ready.get("status") == "True"
+    if not any(node_ready.values()):
+        return
+
+    active_pods = [pod for pod in pods
+                   if not (pod.get("metadata") or {}).get("deletionTimestamp")]
+    # A replacement already scheduled on a healthy node can make progress; do
+    # not evict another replica while it starts.
+    if any(node_ready.get((pod.get("spec") or {}).get("nodeName")) is True
+           for pod in active_pods):
+        return
+
+    for pod in active_pods:
+        metadata = pod.get("metadata") or {}
+        node_name = (pod.get("spec") or {}).get("nodeName")
+        uid = metadata.get("uid")
+        name = metadata.get("name")
+        if (not name or not uid or uid in attempted_uids or not node_name
+                or node_ready.get(node_name) is not False):
+            continue
+        attempted_uids.add(uid)
+        _clone_log(
+            work,
+            f"MCO controller pod {name} is stranded on NotReady node {node_name}; "
+            "conditionally rescheduling it on a Ready node")
+        resource_path = (
+            "/api/v1/namespaces/openshift-machine-config-operator/pods/"
+            f"{urllib.parse.quote(name, safe='')}"
+        )
+        deleted = env.run(
+            compact_kubernetes_delete_proxy_script(
+                clone_oc, resource_path, {"uid": str(uid)}),
+            check=False)
+        if deleted.returncode == 0:
+            _clone_log(work, f"requested reschedule of MCO controller pod {name}")
+        else:
+            detail = (deleted.stderr or deleted.stdout or "conditional delete did not apply").strip()
+            _clone_log(work, f"MCO controller pod reschedule was not applied ({detail})")
+        return
+
+
 def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout_seconds=600):
     """Wait for the MCO-owned ControllerConfig to generate clone-specific 00-master."""
     domain = f"test-infra-cluster-{clone_id}.redhat.com"
@@ -4051,6 +4114,8 @@ def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout
     started = time.monotonic()
     deadline = started + timeout_seconds
     next_status_log = started + 30
+    next_controller_check = started
+    attempted_controller_uids = set()
     last_detail = "MCO source objects were not readable"
     while time.monotonic() < deadline:
         controller = env.run(
@@ -4069,6 +4134,12 @@ def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout
             if controller_infra_ready and controller_dns_ready and machineconfig_ready:
                 _clone_log(work, "MCO ControllerConfig generated clone-specific 00-master")
                 return
+            now = time.monotonic()
+            if (controller_infra_ready and controller_dns_ready and not machineconfig_ready
+                    and now >= next_controller_check):
+                _reschedule_compact_mco_controller_from_unready_node(
+                    clone_oc, work, attempted_controller_uids)
+                next_controller_check = now + 10
             last_detail = (
                 f"ControllerConfig Infrastructure={'ready' if controller_infra_ready else 'pending'}, "
                 f"DNS={'ready' if controller_dns_ready else 'pending'}, "
