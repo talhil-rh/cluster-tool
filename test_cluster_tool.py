@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -20,6 +21,11 @@ spec = importlib.util.spec_from_loader("cluster_tool", loader, origin="./cluster
 ct = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ct)
 ct._init_paths("/data/cluster-tool")
+_TEST_HOME = tempfile.TemporaryDirectory(prefix="cluster-tool-tests-")
+ct._REAL_HOME = Path(_TEST_HOME.name)
+ct.KUBECONFIG_DIR = ct._REAL_HOME / ".kube"
+ct.CLIENT_CONFIG_DIR = ct._REAL_HOME / ".config" / "cluster-tool"
+ct.CLIENT_SERVERS_FILE = ct.CLIENT_CONFIG_DIR / "servers.json"
 
 
 def _fixture_pem(kind, body):
@@ -420,12 +426,12 @@ class TestTemplates(unittest.TestCase):
 class TestDnsEntry(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        self._orig_dnsmasq_dir = ct.DNSMASQ_DIR
-        ct.DNSMASQ_DIR = Path(self.tmpdir)
+        self._orig_dnsmasq_dir = ct._dnsmasq_dir
+        ct._dnsmasq_dir = lambda: Path(self.tmpdir)
         ct.env = ct.ExecutionEnv(host="test@host", host_ip="10.0.0.1")
 
     def tearDown(self):
-        ct.DNSMASQ_DIR = self._orig_dnsmasq_dir
+        ct._dnsmasq_dir = self._orig_dnsmasq_dir
 
     @patch("subprocess.run")
     def test_add_dns_entry_creates_file(self, mock_run):
@@ -497,16 +503,30 @@ class TestTransactionalBoot(unittest.TestCase):
         self.mock_env = MockStateEnv()
         self.mock_env.setup(self._INITIAL_STATE)
         self.calls = []
+        self._original_client_config_dir = ct.CLIENT_CONFIG_DIR
+        self._client_config_tmp = tempfile.TemporaryDirectory(prefix="cluster-tool-state-")
+        ct.CLIENT_CONFIG_DIR = Path(self._client_config_tmp.name)
+        self._dnsmasq_tmp = tempfile.TemporaryDirectory(prefix="cluster-tool-dnsmasq-")
+        self._dnsmasq_patch = patch.object(
+            ct, "_dnsmasq_dir", return_value=Path(self._dnsmasq_tmp.name))
+        self._dnsmasq_patch.start()
+        self._dns_reload_patch = patch.object(ct, "_reload_dns")
+        self._dns_reload_patch.start()
         self._ps_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
         json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, self._ps_file)
         self._ps_file.close()
 
     def tearDown(self):
         os.unlink(self._ps_file.name)
+        self._dns_reload_patch.stop()
+        self._dnsmasq_patch.stop()
+        self._dnsmasq_tmp.cleanup()
+        ct.CLIENT_CONFIG_DIR = self._original_client_config_dir
+        self._client_config_tmp.cleanup()
 
     def _boot_args(self, no_rollback=False):
         return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=no_rollback,
-                                  pull_secret=self._ps_file.name)
+                                  pull_secret=self._ps_file.name, vcpus=None, memory_kib=None)
 
     def _make_ssh_mock(self, fail_on):
         destroyed = set()
@@ -1805,6 +1825,10 @@ class TestCompactInspect(unittest.TestCase):
                 def rejected(cmd):
                     if "get secret etcd-all-certs" in cmd:
                         return _Cmd(1, "", "connection refused")
+                    if "oc config view" in cmd:
+                        return _Cmd(0, "test-cluster\n")
+                    if "oc config set-cluster" in cmd:
+                        return _Cmd()
                     if "echo yes" in cmd:
                         return _Cmd(0, "yes\n")
                     return _Cmd()
@@ -2030,6 +2054,8 @@ class TestCompactInspect(unittest.TestCase):
         self.assertFalse(ct.compact_install_observation_ready(3, True, [], ["ingress"], True))
         self.assertFalse(ct.compact_install_observation_ready(3, True, [], [], False))
         self.assertTrue(ct.compact_install_observation_ready(3, True, [], [], True))
+        self.assertFalse(ct.compact_install_observation_ready(
+            3, True, [], [], True, endpoints_ready=False))
         finish = inspect.getsource(ct._finish_compact_clone)
         self.assertLess(finish.index("_wait_master_render"), finish.index("_ensure_api_certificates"))
         self.assertNotIn("time.sleep(30)", finish)
@@ -2064,8 +2090,15 @@ class TestCompactInspect(unittest.TestCase):
             ct.env = missing
             self.assertIsNone(ct._load_revision_baselines("/work"))
             with self.assertRaises(SystemExit) as aborted:
+                nodes = [
+                    {"role": role, "ip": ip}
+                    for role, ip in zip(
+                        ct.COMPACT_ROLES,
+                        ("192.168.214.69", "192.168.214.81", "192.168.214.89"),
+                    )
+                ]
                 ct._finish_compact_clone(
-                    {}, "edge14", [], "/id", "/work", "/crypto", "etcd", "cn",
+                    {}, "edge14", nodes, "/id", "/work", "/crypto", "etcd", "cn",
                     "/plan", {}, "192.168.214.81", "/src", [], start_at="health")
             self.assertIn("revision baselines", str(aborted.exception))
             self.assertFalse(any("wait until etcd and the API revisions" in cmd for cmd in missing.calls))
@@ -2216,6 +2249,365 @@ class TestCompactInspect(unittest.TestCase):
         with patch.object(ct, "locked_state", _State):
             with self.assertRaises(SystemExit):
                 ct.record_compact_clone("edge3", 201, "mno-3node")
+
+    def _kubernetes_endpoint_fixtures(self, ips, ready=True):
+        endpoints = {
+            "metadata": {"managedFields": [{"manager": "kube-controller-manager"}]},
+            "subsets": [{
+                "addresses": [{"ip": ip} for ip in ips],
+                "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
+            }],
+        }
+        endpoint_slice = {
+            "metadata": {"managedFields": [{"manager": "kube-controller-manager"}]},
+            "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
+            "endpoints": [
+                {"addresses": [ip], "conditions": {"ready": ready}}
+                for ip in ips
+            ],
+        }
+        return json.dumps(endpoints), json.dumps(endpoint_slice)
+
+    def test_machineconfig_retry_reuses_clone_specific_render(self):
+        domain = "test-infra-cluster-edge20.redhat.com"
+        body = f"KUBERNETES_SERVICE_HOST='api-int.{domain}'\nKUBERNETES_SERVICE_PORT='6443'\n"
+        source = "data:;base64," + base64.b64encode(body.encode()).decode()
+        original = json.dumps({"spec": {"config": {"storage": {"files": [{
+            "path": "/etc/kubernetes/apiserver-url.env",
+            "contents": {"source": source},
+        }]}}}})
+        render = json.dumps({
+            "metadata": {"name": "rendered-master-edge20"},
+            "spec": {"config": {"storage": {"files": [{
+                "path": "/etc/kubernetes/apiserver-url.env",
+                "contents": {"source": source},
+            }]}}},
+        })
+
+        result = ct.compact_ensure_machineconfig_render_change(
+            original, original, domain, existing_render_raw=render)
+        self.assertEqual(json.loads(result)["spec"], json.loads(original)["spec"])
+        self.assertEqual(json.loads(result)["spec"]["config"]["storage"]["files"][0]
+                         ["contents"]["source"], source)
+
+    def test_machine_config_observations_capture_per_node_rollout_timeline(self):
+        raw_nodes = {"items": []}
+        for role in ct.COMPACT_ROLES:
+            raw_nodes["items"].append({
+                "metadata": {
+                    "name": role,
+                    "annotations": {
+                        "machineconfiguration.openshift.io/currentConfig": "rendered-master-old",
+                        "machineconfiguration.openshift.io/desiredConfig": "rendered-master-new",
+                        "machineconfiguration.openshift.io/state": "Working",
+                        "machineconfiguration.openshift.io/reason": "Updating files",
+                    },
+                },
+                "spec": {"unschedulable": role == "master-0-1"},
+                "status": {"conditions": [{
+                    "type": "Ready", "status": "False", "reason": "KubeletNotReady",
+                    "message": "Node is rebooting", "lastTransitionTime": "2026-10-23T21:00:00Z",
+                }]},
+            })
+
+        observations = ct.compact_machine_config_node_observations(
+            ct.compact_parse_node_docs(json.dumps(raw_nodes)))
+        second_master = observations[1]
+        self.assertEqual(second_master["ready"], "False")
+        self.assertEqual(second_master["ready_reason"], "KubeletNotReady")
+        self.assertEqual(second_master["ready_transition"], "2026-10-23T21:00:00Z")
+        self.assertTrue(second_master["unschedulable"])
+        self.assertEqual(second_master["state"], "Working")
+        self.assertEqual(second_master["current"], "rendered-master-old")
+        self.assertEqual(second_master["desired"], "rendered-master-new")
+
+        raw_nodes["items"][1]["spec"]["unschedulable"] = False
+        raw_nodes["items"][1]["metadata"]["annotations"].update({
+            "machineconfiguration.openshift.io/currentConfig": "rendered-master-new",
+            "machineconfiguration.openshift.io/state": "Done",
+        })
+        raw_nodes["items"][1]["status"]["conditions"][0].update({
+            "status": "True", "reason": "KubeletReady",
+            "message": "kubelet is posting ready status",
+            "lastTransitionTime": "2026-10-23T21:05:00Z",
+        })
+        recovered = ct.compact_machine_config_node_observations(
+            ct.compact_parse_node_docs(json.dumps(raw_nodes)))[1]
+        self.assertNotEqual(second_master, recovered)
+        self.assertEqual(recovered["ready"], "True")
+        self.assertEqual(recovered["current"], "rendered-master-new")
+        self.assertEqual(recovered["state"], "Done")
+
+    def test_machine_config_gate_requires_updated_pool_and_every_master(self):
+        desired = "rendered-master-edge20"
+        nodes = [{
+            "name": role, "current_config": desired, "desired_config": desired,
+            "mcd_state": "Done", "mcd_reason": "",
+        } for role in ct.COMPACT_ROLES]
+        pool = {
+            "spec": {"configuration": {"name": desired}},
+            "status": {
+                "configuration": {"name": desired},
+                "conditions": [
+                    {"type": "Updated", "status": "True"},
+                    {"type": "Updating", "status": "False"},
+                    {"type": "Degraded", "status": "False"},
+                ],
+            },
+        }
+        self.assertTrue(ct.compact_machine_config_observation(json.dumps(pool), nodes)[0])
+
+        nodes[1]["current_config"] = "rendered-master-old"
+        ready, detail, observed = ct.compact_machine_config_observation(json.dumps(pool), nodes)
+        self.assertFalse(ready)
+        self.assertEqual(observed, desired)
+        self.assertIn("master-0-1", detail)
+
+        nodes[1]["current_config"] = desired
+        pool["status"]["conditions"][0]["status"] = "False"
+        self.assertFalse(ct.compact_machine_config_observation(json.dumps(pool), nodes)[0])
+
+    def test_machineconfig_retry_canonicalizes_only_once(self):
+        domain = "test-infra-cluster-edge20.redhat.com"
+        body = f"KUBERNETES_SERVICE_HOST='api-int.{domain}'\nKUBERNETES_SERVICE_PORT='6443'\n"
+        source = "data:;base64," + base64.b64encode(body.encode()).decode()
+        original = json.dumps({"spec": {"config": {"storage": {"files": [{
+            "path": "/etc/kubernetes/apiserver-url.env",
+            "contents": {"source": source},
+        }]}}}})
+
+        first = ct.compact_ensure_machineconfig_render_change(original, original, domain)
+        second = ct.compact_ensure_machineconfig_render_change(first, first, domain)
+        first_doc = json.loads(first)
+        second_doc = json.loads(second)
+        first_source = first_doc["spec"]["config"]["storage"]["files"][0]["contents"]["source"]
+        second_source = second_doc["spec"]["config"]["storage"]["files"][0]["contents"]["source"]
+        self.assertEqual(first_source, "data:," + urllib.parse.quote(body, safe=""))
+        self.assertEqual(second_source, first_source)
+        self.assertEqual(
+            ct.rendered_machineconfig_files(first_doc)["/etc/kubernetes/apiserver-url.env"], body)
+
+    def test_kubernetes_endpoint_check_rejects_stale_addresses(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoints, endpoint_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+        endpoints_doc = json.loads(endpoints)
+        endpoints_doc["subsets"][0]["addresses"].append({"ip": "192.168.123.65"})
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), endpoint_slice, clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("192.168.123.65", detail)
+        self.assertEqual(
+            ct.compact_kubernetes_endpoint_managers(endpoints, endpoint_slice),
+            "kube-controller-manager")
+
+    def test_kubernetes_endpoint_check_requires_tcp_6443_on_ready_subset(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoints, endpoint_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+        endpoints_doc = json.loads(endpoints)
+        endpoints_doc["subsets"] = [
+            {
+                "addresses": [{"ip": clone_ips[0]}],
+                "ports": [{"name": "https", "port": 9999, "protocol": "TCP"}],
+            },
+            {
+                "notReadyAddresses": [{"ip": ip} for ip in clone_ips[1:]],
+                "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
+            },
+        ]
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), endpoint_slice, clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("ready Endpoints subset lacks HTTPS/TCP/6443", detail)
+
+    def test_kubernetes_endpoint_check_rejects_udp_6443(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoints, endpoint_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+        endpoints_doc = json.loads(endpoints)
+        endpoints_doc["subsets"][0]["ports"][0]["protocol"] = "UDP"
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), endpoint_slice, clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("ready Endpoints subset lacks HTTPS/TCP/6443", detail)
+
+        endpoints_doc["subsets"][0]["ports"][0].update({
+            "name": "api-alt", "protocol": "TCP",
+        })
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), endpoint_slice, clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("ready Endpoints subset lacks HTTPS/TCP/6443", detail)
+
+        endpoints_doc["subsets"][0]["ports"][0]["name"] = "https"
+        endpoints_doc["subsets"][0]["ports"][0]["protocol"] = "TCP"
+        slice_doc = json.loads(endpoint_slice)
+        slice_doc["ports"][0]["protocol"] = "UDP"
+        ready, detail = ct.compact_kubernetes_endpoints_ready(
+            json.dumps(endpoints_doc), json.dumps(slice_doc), clone_ips)
+        self.assertFalse(ready)
+        self.assertIn("EndpointSlice has no effective HTTPS/TCP/6443", detail)
+
+    def test_endpoint_observation_failures_do_not_consume_repair_budget(self):
+        good = MagicMock(returncode=0, stdout='{"metadata":{}}', stderr="")
+        unavailable = MagicMock(returncode=1, stdout="", stderr="temporary timeout")
+        readable, detail = ct.compact_kubernetes_endpoint_observation(good, unavailable)
+        self.assertFalse(readable)
+        self.assertIn("temporary timeout", detail)
+        malformed = MagicMock(returncode=0, stdout='{"subsets":"bad"}', stderr="")
+        readable, detail = ct.compact_kubernetes_endpoint_observation(malformed, good)
+        self.assertFalse(readable)
+        self.assertIn("subsets was not a list", detail)
+        self.assertEqual(ct.compact_next_endpoint_repair_failures(2, False, False), 2)
+        self.assertEqual(ct.compact_next_endpoint_repair_failures(2, True, False), 3)
+        self.assertEqual(ct.compact_next_endpoint_repair_failures(2, True, True), 0)
+
+    def test_unavailable_endpoint_reads_return_unknown_repair_result(self):
+        class _Env:
+            def run(self, cmd, check=True):
+                return MagicMock(returncode=1, stdout="", stderr="temporary timeout")
+
+        monotonic_values = iter([0, 0, 0, 11])
+        with (patch.object(ct, "env", _Env()),
+              patch.object(ct.time, "monotonic", side_effect=lambda: next(monotonic_values)),
+              patch.object(ct.time, "sleep"), patch("builtins.print")):
+            result = ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": "192.168.220.69"}], "/work", timeout_seconds=10)
+        self.assertIsNone(result)
+
+    def test_missing_endpoint_slice_reports_controller_owned_recovery_limit(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoints, _ = self._kubernetes_endpoint_fixtures(clone_ips)
+
+        class _Env:
+            def run(self, cmd, check=True):
+                if "get endpointslice kubernetes" in cmd:
+                    return MagicMock(returncode=1, stdout="", stderr="NotFound")
+                return MagicMock(returncode=0, stdout=endpoints, stderr="")
+
+        monotonic_values = iter([0, 0, 0, 181])
+        with (patch.object(ct, "env", _Env()),
+              patch.object(ct.time, "monotonic", side_effect=lambda: next(monotonic_values)),
+              patch.object(ct.time, "sleep"), patch("builtins.print")):
+            with self.assertRaises(SystemExit) as aborted:
+                ct._refresh_compact_kubernetes_endpoints(
+                    "oc", [{"ip": ip} for ip in clone_ips], "/work", timeout_seconds=180)
+        self.assertIn("automatic creation is unsupported", str(aborted.exception))
+
+    def test_kubernetes_endpoint_repair_is_noop_when_identity_is_correct(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        endpoint_raw, slice_raw = self._kubernetes_endpoint_fixtures(clone_ips)
+
+        class _Env:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                result = MagicMock(returncode=0, stderr="", stdout="")
+                if "get endpointslice kubernetes" in cmd:
+                    result.stdout = slice_raw
+                elif "get endpoints kubernetes" in cmd:
+                    result.stdout = endpoint_raw
+                return result
+
+        fake_env = _Env()
+        with patch.object(ct, "env", fake_env), patch("builtins.print"):
+            self.assertTrue(ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": ip} for ip in clone_ips], "/work"))
+        self.assertFalse(any("curl " in cmd or " patch endpoints" in cmd for cmd in fake_env.calls))
+
+    def test_kubernetes_endpoint_repair_retries_temporary_backend_unavailability(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        source_ips = ["192.168.123.64"]
+        stale_endpoints, stale_slice = self._kubernetes_endpoint_fixtures(source_ips)
+        good_endpoints, good_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+
+        class _Env:
+            def __init__(self):
+                self.calls = []
+                self.endpoints = stale_endpoints
+                self.endpoint_slice = stale_slice
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                result = MagicMock(returncode=0, stderr="", stdout="")
+                if "get endpointslice kubernetes" in cmd:
+                    result.stdout = self.endpoint_slice
+                elif "get endpoints kubernetes" in cmd:
+                    result.stdout = self.endpoints
+                elif "patch endpointslice kubernetes" in cmd:
+                    self.endpoint_slice = good_slice
+                elif "patch endpoints kubernetes" in cmd:
+                    self.endpoints = good_endpoints
+                return result
+
+        failed = [MagicMock(returncode=1) for _ in clone_ips]
+        succeeded = [MagicMock(returncode=0) for _ in clone_ips]
+        fake_env = _Env()
+        with (patch.object(ct, "env", fake_env),
+              patch.object(ct, "_in_parallel_results", side_effect=[failed, succeeded]),
+              patch("time.sleep"), patch("builtins.print")):
+            self.assertTrue(ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": ip} for ip in clone_ips], "/work"))
+        self.assertTrue(any("patch endpoints kubernetes" in cmd for cmd in fake_env.calls))
+        self.assertTrue(any("patch endpointslice kubernetes" in cmd for cmd in fake_env.calls))
+        self.assertGreaterEqual(sum("get endpoints kubernetes" in cmd for cmd in fake_env.calls), 2)
+
+    def test_kubernetes_endpoint_repair_corrects_endpoint_slice_port(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        good_endpoints, good_slice = self._kubernetes_endpoint_fixtures(clone_ips)
+        wrong_slice_doc = json.loads(good_slice)
+        wrong_slice_doc["ports"] = [{"name": "https", "port": 9999, "protocol": "UDP"}]
+
+        class _Env:
+            def __init__(self):
+                self.calls = []
+                self.endpoint_slice = json.dumps(wrong_slice_doc)
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                if "get endpointslice kubernetes" in cmd:
+                    return MagicMock(returncode=0, stdout=self.endpoint_slice, stderr="")
+                if "get endpoints kubernetes" in cmd:
+                    return MagicMock(returncode=0, stdout=good_endpoints, stderr="")
+                if "patch endpointslice kubernetes" in cmd:
+                    self.endpoint_slice = good_slice
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+        fake_env = _Env()
+        probes = [[MagicMock(returncode=0) for _ in clone_ips]]
+        with (patch.object(ct, "env", fake_env),
+              patch.object(ct, "_in_parallel_results", side_effect=probes),
+              patch("time.sleep"), patch("builtins.print")):
+            self.assertTrue(ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": ip} for ip in clone_ips], "/work"))
+        slice_patch = next(
+            cmd for cmd in fake_env.calls if "patch endpointslice kubernetes" in cmd)
+        self.assertIn('"port": 6443', slice_patch)
+        self.assertIn('"protocol": "TCP"', slice_patch)
+
+    def test_kubernetes_endpoint_repair_rejects_unverified_patch(self):
+        clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
+        source_ips = ["192.168.123.64"]
+        stale_endpoints, stale_slice = self._kubernetes_endpoint_fixtures(source_ips)
+
+        class _Env:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, cmd, check=True):
+                self.calls.append(cmd)
+                return MagicMock(returncode=0, stderr="", stdout=(
+                    stale_slice if "endpointslice kubernetes" in cmd else stale_endpoints
+                ))
+
+        fake_env = _Env()
+        probes = [[MagicMock(returncode=0) for _ in clone_ips] for _ in range(3)]
+        with (patch.object(ct, "env", fake_env),
+              patch.object(ct, "_in_parallel_results", side_effect=probes),
+              patch("time.sleep"), patch("builtins.print")):
+            self.assertFalse(ct._refresh_compact_kubernetes_endpoints(
+                "oc", [{"ip": ip} for ip in clone_ips], "/work"))
+        self.assertEqual(sum("patch endpoints kubernetes" in cmd for cmd in fake_env.calls), 3)
 
     def test_apiserver_etcd_trust_copy_uses_only_the_quorum_ca(self):
         command = ct.compact_apiserver_etcd_trust_tar_command()
@@ -3111,7 +3503,7 @@ class TestSetupClient(unittest.TestCase):
         resolv.write_text("nameserver 127.0.0.1\n")
 
         with patch.dict(os.environ, {"SUDO_USER": "testuser"}), \
-             patch.object(ct, "DNSMASQ_DIR", dnsmasq_dir), \
+             patch.object(ct, "_dnsmasq_dir", return_value=dnsmasq_dir), \
              patch("pathlib.Path", wraps=Path) as mock_path:
             orig_path = Path
             class PatchedPath(type(Path())):
@@ -3687,7 +4079,9 @@ class TestPullSecretInjection(unittest.TestCase):
     def _boot_args(self, pull_secret=_SENTINEL):
         if pull_secret is TestPullSecretInjection._SENTINEL:
             pull_secret = self._ps_file.name
-        return argparse.Namespace(name="aabbccdd", flavor="default", no_rollback=False, pull_secret=pull_secret)
+        return argparse.Namespace(
+            name="aabbccdd", flavor="default", no_rollback=False,
+            pull_secret=pull_secret, vcpus=None, memory_kib=None)
 
     def _make_all_succeed_ssh(self):
         mock_co = TestTransactionalBoot._MOCK_CO_JSON
@@ -3806,4 +4200,3 @@ class TestPullSecretInjection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -998,10 +998,11 @@ def compact_parse_node_docs(raw):
         status = item.get("status") or {}
         annotations = metadata.get("annotations") or {}
         conditions = status.get("conditions") or []
-        ready = any(
-            condition.get("type") == "Ready" and condition.get("status") == "True"
-            for condition in conditions
-        )
+        ready_condition = next((
+            condition for condition in conditions
+            if condition.get("type") == "Ready"
+        ), {})
+        ready = ready_condition.get("status") == "True"
         internal_ip = next((
             address.get("address", "")
             for address in status.get("addresses") or []
@@ -1010,13 +1011,44 @@ def compact_parse_node_docs(raw):
         rows.append({
             "name": metadata.get("name", ""),
             "ready": ready,
+            "ready_status": ready_condition.get("status", "Unknown"),
+            "ready_reason": str(ready_condition.get("reason") or "").strip(),
+            "ready_message": " ".join(
+                str(ready_condition.get("message") or "").split())[:240],
+            "ready_transition": str(ready_condition.get("lastTransitionTime") or "").strip(),
+            "unschedulable": bool((item.get("spec") or {}).get("unschedulable", False)),
             "ip": internal_ip,
             "current_config": annotations.get("machineconfiguration.openshift.io/currentConfig", ""),
             "desired_config": annotations.get("machineconfiguration.openshift.io/desiredConfig", ""),
             "mcd_state": annotations.get("machineconfiguration.openshift.io/state", ""),
-            "mcd_reason": str(annotations.get("machineconfiguration.openshift.io/reason") or "").strip(),
+            "mcd_reason": " ".join(
+                str(annotations.get("machineconfiguration.openshift.io/reason") or "").split())[:240],
         })
     return rows
+
+
+def compact_machine_config_node_observations(node_rows):
+    """Return stable per-master MCD, drain, and Ready state for timing logs."""
+    by_name = {row.get("name"): row for row in node_rows}
+    observations = []
+    for role in COMPACT_ROLES:
+        node = by_name.get(role)
+        if not node:
+            observations.append({"role": role, "missing": True})
+            continue
+        observations.append({
+            "role": role,
+            "ready": node.get("ready_status", "Unknown"),
+            "ready_reason": node.get("ready_reason", ""),
+            "ready_message": node.get("ready_message", ""),
+            "ready_transition": node.get("ready_transition", ""),
+            "unschedulable": node.get("unschedulable", False),
+            "state": node.get("mcd_state", ""),
+            "current": node.get("current_config", ""),
+            "desired": node.get("desired_config", ""),
+            "reason": node.get("mcd_reason", ""),
+        })
+    return observations
 
 
 def compact_machine_config_observation(raw_mcp, node_rows):
@@ -1117,6 +1149,21 @@ def compact_machineconfig_identity(raw, clone_domain):
             "The desired master render is missing the clone-specific "
             "/etc/kubernetes/apiserver-url.env")
     return name, api_url
+
+
+def compact_machineconfig_has_clone_api_url(raw, clone_domain):
+    """Whether a rendered MachineConfig already contains this clone's API URL."""
+    try:
+        doc = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(doc, dict):
+        return False
+    name = (doc.get("metadata") or {}).get("name", "")
+    api_url = rendered_machineconfig_files(doc).get(
+        "/etc/kubernetes/apiserver-url.env", "")
+    wanted = f"KUBERNETES_SERVICE_HOST='api-int.{clone_domain}'"
+    return name.startswith("rendered-master-") and wanted in api_url.splitlines()
 HEAL_NODE_FILES = (
     "/var/lib/kubelet/kubeconfig",
     "/etc/kubernetes/kubeconfig",
@@ -1903,11 +1950,16 @@ def rewrite_machineconfig(raw, pairs):
     return json.dumps(doc)
 
 
-def compact_ensure_machineconfig_render_change(previous_raw, rewritten_raw, clone_domain):
-    """Ensure a retry changes 00-master spec so MCO queues a fresh render."""
+def compact_ensure_machineconfig_render_change(
+    previous_raw, rewritten_raw, clone_domain, existing_render_raw=None,
+):
+    """Make one stable 00-master change when the current render lacks clone identity."""
     previous = json.loads(previous_raw)
     rewritten = json.loads(rewritten_raw)
     if previous.get("spec") != rewritten.get("spec"):
+        return json.dumps(rewritten)
+
+    if compact_machineconfig_has_clone_api_url(existing_render_raw, clone_domain):
         return json.dumps(rewritten)
 
     path = "/etc/kubernetes/apiserver-url.env"
@@ -1924,15 +1976,11 @@ def compact_ensure_machineconfig_render_change(previous_raw, rewritten_raw, clon
         source = (item.get("contents") or {}).get("source") or ""
         if not source.startswith("data:") or "," not in source:
             break
-        header = source.split(",", 1)[0]
-        if "base64" in header.lower():
-            payload = urllib.parse.quote(body, safe="")
-            item["contents"]["source"] = "data:," + payload
-        else:
-            payload = base64.b64encode(body.encode()).decode()
-            item["contents"]["source"] = "data:;base64," + payload
-        if previous.get("spec") == rewritten.get("spec"):
-            break
+        # Use a fixed representation so a retry cannot alternate between
+        # equivalent data URLs and generate another rendered MachineConfig.
+        canonical_source = "data:," + urllib.parse.quote(body, safe="")
+        if source != canonical_source:
+            item["contents"]["source"] = canonical_source
         return json.dumps(rewritten)
 
     sys.exit(
@@ -2947,6 +2995,347 @@ def _publish_clone_addresses(clone_oc, nodes, pairs):
                 check=False)
 
 
+def compact_kubernetes_endpoint_managers(endpoints_raw, slice_raw):
+    """Summarize field managers that last wrote the Kubernetes API endpoints."""
+    managers = set()
+    for raw in (endpoints_raw, slice_raw):
+        try:
+            doc = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        for entry in (doc.get("metadata") or {}).get("managedFields") or []:
+            manager = entry.get("manager")
+            if manager:
+                managers.add(str(manager))
+    return ",".join(sorted(managers)) or "unknown"
+
+
+def compact_kubernetes_endpoint_observation(endpoints_result, slice_result):
+    """Distinguish failed/malformed endpoint reads from valid stale resources."""
+    errors = []
+    for label, result in (
+        ("Endpoints", endpoints_result), ("EndpointSlice", slice_result),
+    ):
+        if result is None or getattr(result, "returncode", 1) != 0:
+            detail = str(getattr(result, "stderr", "") or "").strip()
+            errors.append(f"{label} read failed" + (f": {detail}" if detail else ""))
+            continue
+        raw = getattr(result, "stdout", "") or ""
+        try:
+            doc = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            errors.append(f"{label} response was not valid JSON")
+            continue
+        if not isinstance(doc, dict):
+            errors.append(f"{label} response was not a JSON object")
+            continue
+        expected_kind = "Endpoints" if label == "Endpoints" else "EndpointSlice"
+        if doc.get("kind") is not None and doc.get("kind") != expected_kind:
+            errors.append(f"{label} response kind was not {expected_kind}")
+        metadata = doc.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            errors.append(f"{label} metadata was not an object")
+        list_fields = ("subsets",) if label == "Endpoints" else ("endpoints", "ports")
+        object_lists = {}
+        for field in list_fields:
+            items = doc.get(field)
+            if items is None:
+                items = []
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                errors.append(f"{label} {field} was not a list of objects")
+                continue
+            object_lists[field] = items
+        if label == "Endpoints":
+            for subset in object_lists.get("subsets", []):
+                for field in ("addresses", "notReadyAddresses", "ports"):
+                    items = subset.get(field)
+                    if items is None:
+                        items = []
+                    if not isinstance(items, list) or any(
+                        not isinstance(item, dict) for item in items
+                    ):
+                        errors.append(f"Endpoints subset {field} was not a list of objects")
+                        continue
+                    if field in ("addresses", "notReadyAddresses"):
+                        for item in items:
+                            if item.get("ip") is not None and not isinstance(item["ip"], str):
+                                errors.append(f"Endpoints subset {field} contained a non-string IP")
+                    else:
+                        for item in items:
+                            port_number = item.get("port")
+                            protocol = item.get("protocol")
+                            if port_number is not None and type(port_number) is not int:
+                                errors.append("Endpoints port number was not an integer")
+                            if protocol is not None and not isinstance(protocol, str):
+                                errors.append("Endpoints protocol was not a string")
+        else:
+            for endpoint in object_lists.get("endpoints", []):
+                addresses = endpoint.get("addresses")
+                if addresses is None:
+                    addresses = []
+                conditions = endpoint.get("conditions")
+                if not isinstance(addresses, list) or any(
+                    not isinstance(address, str) for address in addresses
+                ):
+                    errors.append("EndpointSlice endpoint addresses were not a list of strings")
+                if conditions is not None and not isinstance(conditions, dict):
+                    errors.append("EndpointSlice endpoint conditions were not an object")
+            for port in object_lists.get("ports", []):
+                port_number = port.get("port")
+                protocol = port.get("protocol")
+                if port_number is not None and type(port_number) is not int:
+                    errors.append("EndpointSlice port number was not an integer")
+                if protocol is not None and not isinstance(protocol, str):
+                    errors.append("EndpointSlice protocol was not a string")
+    return not errors, "; ".join(errors)
+
+
+def compact_kubernetes_endpoint_missing_resources(endpoints_result, slice_result):
+    """Identify controller-managed endpoint resources that returned NotFound."""
+    missing = []
+    for label, result in (
+        ("Endpoints", endpoints_result), ("EndpointSlice", slice_result),
+    ):
+        if result is None or getattr(result, "returncode", 1) == 0:
+            continue
+        detail = str(getattr(result, "stderr", "") or "").lower()
+        if "not found" in detail or "notfound" in detail:
+            missing.append(label)
+    return missing
+
+
+def compact_next_endpoint_repair_failures(previous, observation_valid, identity_ready):
+    """Count only consecutive failed repairs, ignoring read failures and recovery."""
+    if not observation_valid:
+        return previous
+    if identity_ready:
+        return 0
+    return previous + 1
+
+
+def _compact_https_api_port(port):
+    """Whether an endpoint port resolves to the Kubernetes HTTPS port."""
+    return (
+        isinstance(port, dict)
+        and port.get("name") == "https"
+        and type(port.get("port")) is int
+        and port.get("port") == 6443
+        and port.get("protocol") in (None, "TCP")
+    )
+
+
+def compact_kubernetes_endpoints_ready(
+    endpoints_raw, slice_raw, node_ips, require_ready=True,
+):
+    """Check both Kubernetes API endpoint resources against the clone addresses."""
+    try:
+        endpoints = json.loads(endpoints_raw) if isinstance(endpoints_raw, str) else endpoints_raw
+        endpoint_slice = json.loads(slice_raw) if isinstance(slice_raw, str) else slice_raw
+    except (json.JSONDecodeError, TypeError):
+        return False, "endpoint resources unavailable"
+    if not isinstance(endpoints, dict) or not isinstance(endpoint_slice, dict):
+        return False, "endpoint resources unavailable"
+
+    expected = {str(ip) for ip in node_ips}
+    endpoint_addresses = set()
+    endpoint_ready = set()
+    endpoint_port_addresses = set()
+    endpoint_ready_without_api_port = set()
+    for subset in (endpoints.get("subsets") or []):
+        ready_addresses = set()
+        for address in subset.get("addresses") or []:
+            ip = address.get("ip")
+            if ip:
+                endpoint_addresses.add(str(ip))
+                ready_addresses.add(str(ip))
+        for address in subset.get("notReadyAddresses") or []:
+            ip = address.get("ip")
+            if ip:
+                endpoint_addresses.add(str(ip))
+        subset_addresses = ready_addresses | {
+            str(address["ip"])
+            for address in subset.get("notReadyAddresses") or []
+            if address.get("ip")
+        }
+        if any(_compact_https_api_port(port) for port in subset.get("ports") or []):
+            endpoint_port_addresses.update(subset_addresses)
+            endpoint_ready.update(ready_addresses)
+        else:
+            endpoint_ready_without_api_port.update(ready_addresses)
+
+    slice_addresses = set()
+    slice_ready = set()
+    for endpoint in (endpoint_slice.get("endpoints") or []):
+        addresses = {str(ip) for ip in endpoint.get("addresses") or [] if ip}
+        slice_addresses.update(addresses)
+        if (endpoint.get("conditions") or {}).get("ready") is True:
+            slice_ready.update(addresses)
+    slice_port_ready = any(
+        _compact_https_api_port(port)
+        for port in (endpoint_slice.get("ports") or [])
+    )
+
+    stale = sorted((endpoint_addresses | slice_addresses) - expected)
+    if stale:
+        return False, "stale addresses=" + ",".join(stale)
+    if not endpoint_addresses or not slice_addresses:
+        return False, "one or both endpoint resources have no addresses"
+    if endpoint_addresses != slice_addresses:
+        return False, "Endpoints and EndpointSlice address sets differ"
+    if endpoint_ready_without_api_port:
+        return False, "ready Endpoints subset lacks HTTPS/TCP/6443 for addresses=" + ",".join(
+            sorted(endpoint_ready_without_api_port))
+    if not endpoint_port_addresses:
+        return False, "no Endpoints subset maps addresses to HTTPS/TCP/6443"
+    if not slice_port_ready:
+        return False, "EndpointSlice has no effective HTTPS/TCP/6443 port"
+    if require_ready and endpoint_ready != slice_ready:
+        return False, "Endpoints and EndpointSlice ready address sets differ"
+    if require_ready and (not endpoint_ready or not slice_ready):
+        return False, "no ready clone API backend"
+    return True, "clone addresses and HTTPS/TCP port 6443 verified"
+
+
+def _read_compact_kubernetes_endpoints(clone_oc):
+    """Read both API service endpoint representations."""
+    endpoints = env.run(
+        f"{clone_oc} get endpoints kubernetes -n default -o json", check=False)
+    endpoint_slice = env.run(
+        f"{clone_oc} get endpointslice kubernetes -n default -o json", check=False)
+    return endpoints, endpoint_slice
+
+
+def _refresh_compact_kubernetes_endpoints(
+    clone_oc, nodes, work, timeout_seconds=180,
+):
+    """Converge both Kubernetes API endpoint resources on healthy clone masters."""
+    node_ips = [node["ip"] for node in nodes]
+    deadline = time.monotonic() + timeout_seconds
+    last_detail = "endpoint resources were not readable"
+    endpoints = endpoint_slice = None
+    endpoint_raw = slice_raw = ""
+    unsupported_endpoint_missing = False
+    while time.monotonic() < deadline:
+        endpoints, endpoint_slice = _read_compact_kubernetes_endpoints(clone_oc)
+        readable, read_detail = compact_kubernetes_endpoint_observation(
+            endpoints, endpoint_slice)
+        if readable:
+            endpoint_raw = endpoints.stdout or ""
+            slice_raw = endpoint_slice.stdout or ""
+            break
+        last_detail = read_detail
+        missing_resources = compact_kubernetes_endpoint_missing_resources(
+            endpoints, endpoint_slice)
+        unsupported_endpoint_missing = bool(missing_resources)
+        if missing_resources:
+            last_detail = (
+                f"{' and '.join(missing_resources)} default/kubernetes is missing; "
+                "automatic creation is unsupported because it is controller-managed"
+            )
+        time.sleep(min(5, max(0, deadline - time.monotonic())))
+    else:
+        managers = compact_kubernetes_endpoint_managers(endpoint_raw, slice_raw)
+        _clone_log(
+            work,
+            f"Kubernetes endpoint convergence failed ({last_detail}); "
+            f"field managers={managers}")
+        if unsupported_endpoint_missing:
+            sys.exit(f"{last_detail}. Log: {work}/clone.log")
+        return None
+
+    identity_ok, detail = compact_kubernetes_endpoints_ready(
+        endpoint_raw, slice_raw, node_ips, require_ready=False)
+    if identity_ok:
+        _clone_log(work, "Kubernetes service endpoints already match clone addresses")
+        return True
+
+    last_detail = detail
+    last_managers = compact_kubernetes_endpoint_managers(endpoint_raw, slice_raw)
+    patch_attempts = 0
+    verified_invalid = False
+    while time.monotonic() < deadline:
+        probes = _in_parallel_results(
+            nodes,
+            lambda node: env.run(
+                f"curl --silent --show-error --fail --insecure --connect-timeout 2 --max-time 6 "
+                f"--output /dev/null {shlex.quote('https://' + node['ip'] + ':6443/readyz')}",
+                check=False),
+        )
+        healthy = [
+            node["ip"] for node, probe in zip(nodes, probes)
+            if probe.returncode == 0
+        ]
+        if not healthy:
+            last_detail = "no clone API node passed /readyz yet"
+            time.sleep(min(5, max(0, deadline - time.monotonic())))
+            continue
+
+        endpoints_patch = {
+            "subsets": [{
+                "addresses": [{"ip": ip} for ip in healthy],
+                "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}],
+            }],
+        }
+        endpoint_patch = env.run(
+            f"{clone_oc} patch endpoints kubernetes -n default --type=merge "
+            f"-p {shlex.quote(json.dumps(endpoints_patch))}",
+            check=False,
+        )
+        slice_patch = {
+            "ports": [{"name": "https", "protocol": "TCP", "port": 6443}],
+            "endpoints": [
+                {"addresses": [ip], "conditions": {"ready": True}}
+                for ip in healthy
+            ],
+        }
+        slice_result = env.run(
+            f"{clone_oc} patch endpointslice kubernetes -n default --type=merge "
+            f"-p {shlex.quote(json.dumps(slice_patch))}",
+            check=False,
+        )
+        patch_attempts += 1
+        verified_endpoints, verified_slice = _read_compact_kubernetes_endpoints(clone_oc)
+        readable, read_detail = compact_kubernetes_endpoint_observation(
+            verified_endpoints, verified_slice)
+        if endpoint_patch.returncode != 0 or slice_result.returncode != 0:
+            details = "; ".join(
+                text for text in (
+                    (endpoint_patch.stderr or "").strip(),
+                    (slice_result.stderr or "").strip(),
+                ) if text)
+            last_detail = "patch failed" + (f": {details}" if details else "")
+        if readable:
+            ready, last_detail = compact_kubernetes_endpoints_ready(
+                verified_endpoints.stdout or "", verified_slice.stdout or "", node_ips)
+            if ready:
+                _clone_log(
+                    work,
+                    "replaced and verified Kubernetes service endpoints with "
+                    f"{len(healthy)} healthy clone API address(es)")
+                return True
+            verified_invalid = True
+            last_managers = compact_kubernetes_endpoint_managers(
+                verified_endpoints.stdout or "", verified_slice.stdout or "")
+            _clone_log(
+                work,
+                f"Kubernetes endpoint repair was not retained ({last_detail}); "
+                f"field managers={last_managers}")
+        else:
+            last_detail = "endpoint read-back failed: " + read_detail
+
+        if patch_attempts >= 3:
+            break
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+    _clone_log(
+        work,
+        f"Kubernetes endpoint convergence failed ({last_detail}); "
+        f"field managers={last_managers}")
+    return False if verified_invalid else None
+
+
 def _wait_master_render(clone_oc, previous_render):
     """Wait until the machine-config pool renders a new master config."""
     if not previous_render:
@@ -3151,21 +3540,44 @@ def _finish_compact_clone(
     if start_at != "health":
         _clone_log(work, "rewrite cluster records and 00-master")
         mc = env.run(f"{clone_oc} get machineconfig 00-master -o json", check=False)
-        previous_render = env.run(
-            f"{clone_oc} get mcp master -o jsonpath='{{.status.configuration.name}}'",
-            check=False).stdout.strip()
+        previous_mcp = env.run(f"{clone_oc} get mcp master -o json", check=False)
+        if previous_mcp.returncode != 0 or not (previous_mcp.stdout or "").strip():
+            sys.exit(f"Could not read the master MachineConfigPool before the clone rewrite. Log: {work}/clone.log")
+        try:
+            previous_mcp_doc = json.loads(previous_mcp.stdout)
+        except json.JSONDecodeError:
+            sys.exit(f"The master MachineConfigPool response was invalid JSON. Log: {work}/clone.log")
+        previous_render = ((previous_mcp_doc.get("status") or {}).get("configuration") or {}).get("name", "")
+        previous_desired_render = ((previous_mcp_doc.get("spec") or {}).get("configuration") or {}).get("name", "")
         if mc.returncode != 0 or not (mc.stdout or "").strip():
             sys.exit(f"Could not read MachineConfig 00-master before the clone rewrite. Log: {work}/clone.log")
-        if not previous_render:
+        if not previous_render or not previous_desired_render:
             sys.exit(f"Could not read the current master render before the clone rewrite. Log: {work}/clone.log")
         rewritten_mc = rewrite_machineconfig(mc.stdout, pairs)
+        rewritten_doc = json.loads(rewritten_mc)
+        previous_mc_doc = json.loads(mc.stdout)
+        machineconfig_spec_changed = previous_mc_doc.get("spec") != rewritten_doc.get("spec")
+        existing_render_raw = ""
+        existing_render_matches = False
+        if not machineconfig_spec_changed:
+            existing_render = env.run(
+                f"{clone_oc} get machineconfig {shlex.quote(previous_desired_render)} -o json",
+                check=False)
+            if existing_render.returncode == 0 and (existing_render.stdout or "").strip():
+                existing_render_raw = existing_render.stdout
+                existing_render_matches = compact_machineconfig_has_clone_api_url(
+                    existing_render_raw, domain)
         rewritten_mc = compact_ensure_machineconfig_render_change(
-            mc.stdout, rewritten_mc, domain)
+            mc.stdout, rewritten_mc, domain,
+            existing_render_raw=existing_render_raw if existing_render_matches else None)
         env.write_file(f"{work}/00-master.json", rewritten_mc)
         replaced = env.run(f"{clone_oc} replace -f {shlex.quote(work + '/00-master.json')}", check=False)
         if replaced.returncode != 0:
             detail = (replaced.stderr or "").strip()
             sys.exit(f"Could not update MachineConfig 00-master: {detail}. Log: {work}/clone.log")
+        reuse_existing_render = (
+            not machineconfig_spec_changed and existing_render_matches
+        )
 
         def apply_identity_records():
             def rewrite_object(item):
@@ -3239,26 +3651,38 @@ def _finish_compact_clone(
         # Kubelets need the clone internal API certificate to reconnect. Repair it
         # while MCO renders so its controller can come back and publish the render.
         _clone_log(work, "ensure clone API certificates while waiting for MCO render")
+
+        def resolve_master_render():
+            if reuse_existing_render:
+                _clone_log(
+                    work,
+                    f"reusing clone-specific master render {previous_desired_render} on retry")
+                return previous_desired_render, existing_render_raw
+            rendered_name = _wait_master_render(clone_oc, previous_desired_render)
+            raw = env.run(
+                f"{clone_oc} get machineconfig {shlex.quote(rendered_name)} -o json", check=False)
+            if raw.returncode != 0 or not (raw.stdout or "").strip():
+                detail = (raw.stderr or "").strip()
+                sys.exit(
+                    f"Could not read the desired master render {rendered_name}: "
+                    f"{detail}. Log: {work}/clone.log")
+            return rendered_name, raw.stdout
+
         parallel_results = _call_together({
-            "render": lambda: _wait_master_render(clone_oc, previous_render),
+            "render": resolve_master_render,
             "api-certificates": lambda: _ensure_api_certificates(
                 clone_oc, work, domain, api_vip, nodes, identity),
         })
-        rendered = parallel_results["render"]
-        raw_render = env.run(
-            f"{clone_oc} get machineconfig {shlex.quote(rendered)} -o json", check=False)
-        if raw_render.returncode != 0 or not (raw_render.stdout or "").strip():
-            detail = (raw_render.stderr or "").strip()
-            sys.exit(f"Could not read the desired master render {rendered}: {detail}. Log: {work}/clone.log")
+        rendered, raw_render_text = parallel_results["render"]
         desired_master_render, expected_api_url = compact_machineconfig_identity(
-            raw_render.stdout, domain)
+            raw_render_text, domain)
         if desired_master_render != rendered:
             sys.exit(
                 f"MCP returned render {rendered}, but the MachineConfig is "
                 f"{desired_master_render}. Log: {work}/clone.log")
-        env.write_file(f"{work}/currentconfig.json", raw_render.stdout)
+        env.write_file(f"{work}/currentconfig.json", raw_render_text)
         heal_files = {
-            path: body for path, body in rendered_machineconfig_files(raw_render.stdout).items()
+            path: body for path, body in rendered_machineconfig_files(raw_render_text).items()
             if path in HEAL_NODE_FILES
         }
         if heal_files.get("/etc/kubernetes/apiserver-url.env") != expected_api_url:
@@ -3347,6 +3771,11 @@ def _finish_compact_clone(
                 check=False),
         })
 
+    if not _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work):
+        sys.exit(
+            "Could not converge Kubernetes service endpoints on clone API addresses. "
+            f"Log: {work}/clone.log")
+
     if not _revision_int(etcd_revision_baseline) or not _revision_int(apiserver_revision_baseline):
         sys.exit(
             "Refusing to wait for install revisions without an etcd baseline "
@@ -3365,17 +3794,45 @@ def _finish_compact_clone(
     last_core_blocker = ""
     last_revision_sample = None
     last_mco_sample = None
+    last_mco_node_sample = None
     last_observe_signature = None
+    endpoint_repair_failures = 0
+    endpoint_detail = "not observed"
     endpoints = ",".join(f"https://{node['ip']}:2379" for node in nodes)
     while time.time() < deadline:
         watched = _call_together({
             "nodes": lambda: env.run(f"{clone_oc} get nodes -o json", check=False),
             "mcp": lambda: env.run(f"{clone_oc} get mcp master -o json", check=False),
             "co": lambda: env.run(f"{clone_oc} get co -o json", check=False),
+            "endpoints": lambda: env.run(
+                f"{clone_oc} get endpoints kubernetes -n default -o json", check=False),
+            "endpoint-slice": lambda: env.run(
+                f"{clone_oc} get endpointslice kubernetes -n default -o json", check=False),
         })
         docs = compact_operator_docs(watched["co"].stdout or "")
         operators = compact_operators_from_docs(docs)
         parsed_nodes = compact_parse_node_docs(watched["nodes"].stdout or "")
+        mco_node_sample = compact_machine_config_node_observations(parsed_nodes)
+        mco_node_signature = tuple(
+            tuple(sorted(observation.items())) for observation in mco_node_sample)
+        if mco_node_signature != last_mco_node_sample:
+            for observation in mco_node_sample:
+                if observation.get("missing"):
+                    _clone_log(work, f"machine-config node {observation['role']} missing")
+                    continue
+                _clone_log(
+                    work,
+                    f"machine-config node {observation['role']} "
+                    f"ready={observation['ready']} "
+                    f"ready-reason={observation['ready_reason'] or 'none'} "
+                    f"ready-transition={observation['ready_transition'] or 'unknown'} "
+                    f"unschedulable={observation['unschedulable']} "
+                    f"state={observation['state'] or 'unknown'} "
+                    f"current={observation['current'] or 'unknown'} "
+                    f"desired={observation['desired'] or 'unknown'} "
+                    f"mcd-reason={observation['reason'] or 'none'} "
+                    f"ready-message={observation['ready_message'] or 'none'}")
+            last_mco_node_sample = mco_node_signature
         addresses_ok = compact_node_ips_ready(parsed_nodes, nodes)
         ready = sum(1 for node in parsed_nodes if node.get("ready"))
         unhealthy = [
@@ -3392,6 +3849,76 @@ def _finish_compact_clone(
         )
         machine_config_ready, machine_config_detail, observed_master_render = (
             compact_machine_config_observation(watched["mcp"].stdout or "", parsed_nodes))
+        endpoint_reads_valid, endpoint_read_detail = compact_kubernetes_endpoint_observation(
+            watched["endpoints"], watched["endpoint-slice"])
+        endpoint_ready = False
+        if not endpoint_reads_valid:
+            endpoint_detail = "endpoint observation unavailable: " + endpoint_read_detail
+        else:
+            endpoint_ready, endpoint_detail = compact_kubernetes_endpoints_ready(
+                watched["endpoints"].stdout or "",
+                watched["endpoint-slice"].stdout or "",
+                [node["ip"] for node in nodes],
+            )
+            endpoint_identity_ready, endpoint_identity_detail = compact_kubernetes_endpoints_ready(
+                watched["endpoints"].stdout or "",
+                watched["endpoint-slice"].stdout or "",
+                [node["ip"] for node in nodes],
+                require_ready=False,
+            )
+            if endpoint_identity_ready:
+                # Only a valid, identity-correct observation resets the
+                # consecutive repair-failure budget. Failed reads neither
+                # count as drift nor erase evidence of a failed repair.
+                endpoint_repair_failures = compact_next_endpoint_repair_failures(
+                    endpoint_repair_failures, True, True)
+            else:
+                managers = compact_kubernetes_endpoint_managers(
+                    watched["endpoints"].stdout or "",
+                    watched["endpoint-slice"].stdout or "",
+                )
+                _clone_log(
+                    work,
+                    f"Kubernetes endpoint identity drift ({endpoint_identity_detail}); "
+                    f"field managers={managers}; attempting repair")
+                repaired = _refresh_compact_kubernetes_endpoints(
+                    clone_oc, nodes, work, timeout_seconds=30)
+                if repaired is True:
+                    checked_endpoints, checked_slice = _read_compact_kubernetes_endpoints(clone_oc)
+                    checked_valid, checked_detail = compact_kubernetes_endpoint_observation(
+                        checked_endpoints, checked_slice)
+                    if checked_valid:
+                        endpoint_ready, endpoint_detail = compact_kubernetes_endpoints_ready(
+                            checked_endpoints.stdout or "",
+                            checked_slice.stdout or "",
+                            [node["ip"] for node in nodes],
+                        )
+                        endpoint_identity_ready, endpoint_identity_detail = compact_kubernetes_endpoints_ready(
+                            checked_endpoints.stdout or "",
+                            checked_slice.stdout or "",
+                            [node["ip"] for node in nodes],
+                            require_ready=False,
+                        )
+                        endpoint_repair_failures = compact_next_endpoint_repair_failures(
+                            endpoint_repair_failures, True, endpoint_identity_ready)
+                        if not endpoint_identity_ready:
+                            endpoint_detail = endpoint_identity_detail
+                    else:
+                        endpoint_detail = "endpoint read-back unavailable: " + checked_detail
+                elif repaired is False:
+                    endpoint_repair_failures = compact_next_endpoint_repair_failures(
+                        endpoint_repair_failures, True, False)
+                else:
+                    endpoint_detail = "endpoint repair observation unavailable; retrying"
+                if endpoint_repair_failures >= 3:
+                    managers = compact_kubernetes_endpoint_managers(
+                        watched["endpoints"].stdout or "",
+                        watched["endpoint-slice"].stdout or "",
+                    )
+                    sys.exit(
+                        "Kubernetes API endpoint repair failed three consecutive times; "
+                        f"field managers={managers}; last state={endpoint_detail}. "
+                        f"Log: {work}/clone.log")
         if observed_master_render and observed_master_render != desired_master_render:
             current_render = env.run(
                 f"{clone_oc} get machineconfig {shlex.quote(observed_master_render)} -o json",
@@ -3413,6 +3940,8 @@ def _finish_compact_clone(
                 work,
                 f"machine-config ready={machine_config_ready} {machine_config_detail}")
             last_mco_sample = mco_sample
+        if not endpoint_ready:
+            _clone_log(work, f"Kubernetes API endpoints not ready: {endpoint_detail}")
         revision_sample = (
             etcd_revision.get("latest"), etcd_revision.get("converged"),
             apiserver_revision.get("latest"), apiserver_revision.get("converged"),
@@ -3436,7 +3965,7 @@ def _finish_compact_clone(
             last_core_blocker = ""
         if not compact_install_observation_ready(
             ready, addresses_ok, core_unhealthy, install_blockers, revisions_ready,
-            machine_config_ready,
+            machine_config_ready, endpoint_ready,
         ):
             stable_samples = 0
             if webhook_confirmed:
@@ -3444,7 +3973,7 @@ def _finish_compact_clone(
                 webhook_confirmed = False
             signature = (
                 ready, addresses_ok, tuple(core_unhealthy), tuple(install_blockers),
-                revision_sample, machine_config_detail,
+                revision_sample, machine_config_detail, endpoint_ready, endpoint_detail,
             )
             if signature != last_observe_signature:
                 _clone_log(
@@ -3452,7 +3981,8 @@ def _finish_compact_clone(
                     f"observe ready={ready} ips={'ok' if addresses_ok else 'stale'} "
                     f"core={','.join(core_unhealthy) or 'none'} "
                     f"install={','.join(install_blockers) or 'none'} "
-                    f"mco={'ready' if machine_config_ready else machine_config_detail}")
+                    f"mco={'ready' if machine_config_ready else machine_config_detail} "
+                    f"api-endpoints={'ready' if endpoint_ready else endpoint_detail}")
                 last_observe_signature = signature
             time.sleep(10)
             continue
@@ -3539,7 +4069,7 @@ def _finish_compact_clone(
             last_etcd_sample = etcd_sample
         install_ready = (
             not install_blockers and revisions_ready and machine_config_ready
-            and not api_url_blockers
+            and not api_url_blockers and endpoint_ready
         )
         stable_samples = compact_next_stable_samples(
             stable_samples, stage, auth_ready, domains_ready, install_ready)
@@ -3560,6 +4090,7 @@ def _finish_compact_clone(
             f"core={','.join(core_unhealthy) or 'none'} "
             f"install={','.join(install_blockers) or 'none'} "
             f"mco={'ready' if machine_config_ready else 'blocked'} "
+            f"api-endpoints={'ready' if endpoint_ready else endpoint_detail} "
             f"api-url={','.join(api_url_blockers) or 'ok'} "
             f"auth={auth_detail} {domain_detail}")
         if stable_samples == 1 and nni_ready and not webhook_confirmed:
@@ -3584,7 +4115,7 @@ def _finish_compact_clone(
         time.sleep(15 if stable_samples else 10)
     sys.exit(
         f"Clone did not become healthy within 40 minutes: {last} auth={last_auth} "
-        f"{last_domains} machine-config={last_mco_detail} "
+        f"{last_domains} machine-config={last_mco_detail} api-endpoints={endpoint_detail} "
         f"apiserver-url={','.join(last_api_url_blockers) or 'not-probed'}. "
         f"Log: {work}/clone.log")
 
@@ -4096,7 +4627,7 @@ def compact_operators_from_docs(docs):
 
 def compact_install_observation_ready(
     ready, addresses_ok, core_unhealthy, install_blockers, revisions_ready,
-    machine_config_ready=True,
+    machine_config_ready=True, endpoints_ready=True,
 ):
     """True when a cheap watch is quiet enough to spend a full validation sample."""
     return (
@@ -4106,6 +4637,7 @@ def compact_install_observation_ready(
         and not install_blockers
         and bool(revisions_ready)
         and bool(machine_config_ready)
+        and bool(endpoints_ready)
     )
 
 
