@@ -376,10 +376,17 @@ def parse_dhcp_hosts(net_xml):
     root = ET.fromstring(net_xml)
     hosts = []
     for host in root.findall(".//dhcp/host"):
+        raw_ip = host.get("ip")
+        try:
+            parsed_ip = ipaddress.ip_address(raw_ip or "")
+        except ValueError as exc:
+            raise ValueError("Libvirt DHCP host has an invalid IP address") from exc
+        if not isinstance(parsed_ip, ipaddress.IPv4Address):
+            raise ValueError("Libvirt DHCP host address must be IPv4")
         hosts.append({
             "mac": host.get("mac"),
             "name": host.get("name"),
-            "ip": host.get("ip"),
+            "ip": str(parsed_ip),
         })
     return hosts
 
@@ -513,7 +520,10 @@ def discover_compact_source(source, network=None):
     domains = resolve_compact_domains(source)
     net_name, net_xml = resolve_compact_network(source, network)
     gateway, machine_network = parse_network_gateway(net_xml)
-    dhcp_hosts = parse_dhcp_hosts(net_xml)
+    try:
+        dhcp_hosts = parse_dhcp_hosts(net_xml)
+    except ValueError as exc:
+        sys.exit(f"Libvirt network '{net_name}' has invalid DHCP host data: {exc}")
     dns = parse_dnsmasq_addresses(net_xml)
     hosts_file = env.run(
         f"cat /var/lib/libvirt/dnsmasq/{shlex.quote(net_name)}.addnhosts",
@@ -1307,6 +1317,7 @@ def kubelet_sign_script(role, ip, signer_dir):
     """Build the script that signs one kubelet client and server certificate."""
     return textwrap.dedent(f"""\
         set -euo pipefail
+        umask 077
         openssl ecparam -name prime256v1 -genkey -out {role}-server.key
         openssl req -new -key {role}-server.key -subj "/O=system:nodes/CN=system:node:{role}" -out {role}-server.csr
         cat > {role}-server.ext << 'CNF'
@@ -1643,11 +1654,37 @@ def require_compact_subnet(state, subnet):
     return subnet
 
 
+def compact_libvirt_conflicts(clone_id):
+    """Return compact domain or network names already defined in libvirt."""
+    domains = {f"test-infra-cluster-{clone_id}-{role}" for role in COMPACT_ROLES}
+    networks = {f"test-infra-net-{clone_id}"}
+    domain_list = env.run("virsh list --all --name", check=False)
+    if domain_list.returncode != 0:
+        sys.exit("Could not check libvirt domains before reserving the compact clone")
+    network_list = env.run("virsh net-list --all --name", check=False)
+    if network_list.returncode != 0:
+        sys.exit("Could not check libvirt networks before reserving the compact clone")
+    found = domains.intersection(line.strip() for line in domain_list.stdout.splitlines())
+    found.update(networks.intersection(line.strip() for line in network_list.stdout.splitlines()))
+    return sorted(found)
+
+
+def require_compact_libvirt_names_free(clone_id):
+    """Fail before disk work if any compact libvirt name is already in use."""
+    conflicts = compact_libvirt_conflicts(clone_id)
+    if conflicts:
+        sys.exit(
+            "Compact clone libvirt names are already in use: "
+            + ", ".join(conflicts)
+            + ". Choose a different clone ID; no resources were changed.")
+
+
 def record_compact_clone(clone_id, subnet, flavor):
     """Reserve a compact clone in state before its disks are copied."""
     with locked_state() as state:
         if clone_id in state["clones"]:
             sys.exit(f"Clone '{clone_id}' already exists.")
+        require_compact_libvirt_names_free(clone_id)
         if subnet is None:
             subnet = allocate_subnet(state)
         require_compact_subnet(state, subnet)
@@ -1660,6 +1697,15 @@ def record_compact_clone(clone_id, subnet, flavor):
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
     return subnet
+
+
+def mark_compact_clone_running(clone_id):
+    """Record that the compact clone passed its install-readiness gate."""
+    with locked_state() as state:
+        clone = state.get("clones", {}).get(clone_id)
+        if clone is None:
+            sys.exit(f"Compact clone '{clone_id}' disappeared from state before readiness was recorded.")
+        clone["status"] = "running"
 
 
 def compact_bridge_name(clone_id):
@@ -4317,14 +4363,16 @@ def _finish_compact_clone(
         _clone_log(work, "Recert finished once; copying quorum etcd certificates back to master-0-0")
         quorum = by_role[QUORUM_ETCD_ROLE]
         env.run(
-            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+            "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
             "'sudo tar -C /etc/kubernetes/static-pod-resources -cf - etcd-certs' "
             f"> {shlex.quote(work + '/etcd-certs-quorum.tar')}")
         env.run(
-            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{recert_node['ip']} "
+            "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{recert_node['ip']} "
             "'sudo tar -C /etc/kubernetes/static-pod-resources -cf - etcd-certs' "
             f"> {shlex.quote(work + '/etcd-certs-node0-recert.tar')}")
-        env.run(f"chmod 600 {shlex.quote(work + '/etcd-certs-node0-recert.tar')}")
+        env.run(
+            f"chmod 600 {shlex.quote(work + '/etcd-certs-quorum.tar')} "
+            f"{shlex.quote(work + '/etcd-certs-node0-recert.tar')}")
         env.run(
             "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
             f"{shlex.quote(work + '/etcd-certs-quorum.tar')} core@{recert_node['ip']}:/var/tmp/etcd-certs-quorum.tar")
@@ -4334,9 +4382,10 @@ def _finish_compact_clone(
             identity)
         _clone_log(work, "restore the original etcd trust onto the Recert apiserver")
         env.run(
-            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+            "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
             f"{shlex.quote(compact_apiserver_etcd_trust_tar_command())} "
             f"> {shlex.quote(work + '/apiserver-etcd-trust.tar')}")
+        env.run(f"chmod 600 {shlex.quote(work + '/apiserver-etcd-trust.tar')}")
         env.run(
             "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
             f"{shlex.quote(work + '/apiserver-etcd-trust.tar')} "
@@ -4347,7 +4396,7 @@ def _finish_compact_clone(
             identity)
         _clone_log(work, "restore quorum client CA and service-account keys onto master-0-0")
         env.run(
-            "ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
+            "umask 077 && ssh " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} core@{quorum['ip']} "
             f"{shlex.quote(compact_apiserver_client_trust_tar_command())} "
             f"> {shlex.quote(work + '/apiserver-client-trust.tar')}")
         env.run(f"chmod 600 {shlex.quote(work + '/apiserver-client-trust.tar')}")
@@ -5285,12 +5334,35 @@ RHCOS_ETCD_DB = "/ostree/deploy/rhcos/var/lib/etcd/member/snap/db"
 _rhcos_deploy_cache = {}
 
 
-def choose_rhcos_deploy(names):
-    """Choose the latest RHCOS deployment directory, ignoring origin files."""
+def parse_booted_ostree_deployment(status):
+    """Extract the deployment ID marked booted by `ostree admin status`."""
+    booted = [line.split() for line in (status or "").splitlines()
+              if line.lstrip().startswith("*")]
+    if len(booted) != 1 or len(booted[0]) < 3:
+        sys.exit("Could not identify exactly one booted OSTree deployment from source status")
+    return booted[0][2]
+
+
+def choose_rhcos_deploy(names, booted_deployment=None):
+    """Select the source's booted deployment, or its sole unambiguous tree."""
     deploys = [name for name in names if name and not name.endswith(".origin")]
     if not deploys:
         sys.exit("No RHCOS deployment on the flavor disk")
-    return sorted(deploys)[-1]
+    if booted_deployment:
+        selected = Path(booted_deployment).name
+        if selected.endswith(".origin"):
+            selected = selected[:-len(".origin")]
+        if selected not in deploys:
+            sys.exit(
+                "The booted OSTree deployment recorded in flavor metadata "
+                "does not exist on the flavor disk")
+        return selected
+    if len(deploys) == 1:
+        return deploys[0]
+    sys.exit(
+        "Flavor disk has multiple RHCOS deployments and no booted deployment "
+        "metadata. Recreate the flavor from a running source so its booted "
+        "OSTree deployment is recorded.")
 
 
 def _guest_run(disk, tool, guest_path, dest=""):
@@ -5301,36 +5373,38 @@ def _guest_run(disk, tool, guest_path, dest=""):
     return env.run(command, check=False)
 
 
-def _rhcos_deploy(disk):
-    """Return the RHCOS deployment directory on a flavor disk."""
-    cached = _rhcos_deploy_cache.get(disk)
+def _rhcos_deploy(disk, booted_deployment=None):
+    """Return the selected RHCOS deployment directory on a flavor disk."""
+    cache_key = (disk, booted_deployment)
+    cached = _rhcos_deploy_cache.get(cache_key)
     if cached:
         return cached
     listing = _guest_run(disk, "virt-ls", RHCOS_DEPLOYS)
     if listing.returncode != 0:
         sys.exit(f"Could not list the RHCOS deployment on {disk}. {(listing.stderr or '').strip()}")
-    deploy = f"{RHCOS_DEPLOYS}/{choose_rhcos_deploy(listing.stdout.split())}"
-    _rhcos_deploy_cache[disk] = deploy
+    deploy = f"{RHCOS_DEPLOYS}/{choose_rhcos_deploy(listing.stdout.split(), booted_deployment)}"
+    _rhcos_deploy_cache[cache_key] = deploy
     return deploy
 
 
-def _guest_cat(disk, path):
+def _guest_cat(disk, path, booted_deployment=None):
     """Read one file from an RHCOS disk."""
-    guest_path = _rhcos_deploy(disk) + path
+    guest_path = _rhcos_deploy(disk, booted_deployment) + path
     r = _guest_run(disk, "virt-cat", guest_path)
     if r.returncode != 0:
         sys.exit(f"Could not read {path} from {disk}. {(r.stderr or '').strip()}")
     return r.stdout
 
 
-def _guest_mac(disk):
+def _guest_mac(disk, booted_deployment=None):
     """Read the NetworkManager MAC from an RHCOS disk."""
-    directory = _rhcos_deploy(disk) + "/etc/NetworkManager/system-connections"
+    directory = _rhcos_deploy(disk, booted_deployment) + "/etc/NetworkManager/system-connections"
     listing = _guest_run(disk, "virt-ls", directory)
     if listing.returncode != 0:
         sys.exit(f"Could not list NetworkManager connections on {disk}")
     for name in listing.stdout.split():
-        mac = parse_nm_mac(_guest_cat(disk, f"/etc/NetworkManager/system-connections/{name}"))
+        mac = parse_nm_mac(_guest_cat(
+            disk, f"/etc/NetworkManager/system-connections/{name}", booted_deployment))
         if mac:
             return mac
     sys.exit(f"No mac-address in NetworkManager connections on {disk}")
@@ -5383,6 +5457,7 @@ def run_compact_from_flavor(
     for key in ("source_primary_subnet", "memory_kib", "vcpus", "etcd_image"):
         if flavor.get(key) in (None, ""):
             sys.exit(f"Flavor '{flavor_name}' is missing {key}")
+    booted_deployment = flavor.get("rhcos_deployment")
     source_subnet = int(flavor["source_primary_subnet"])
     if resume in ("recert", "rewrite", "health"):
         saved = (load_state().get("clones") or {}).get(clone_id)
@@ -5410,22 +5485,23 @@ def run_compact_from_flavor(
             paths.append(f"{fdir}/{spare_name}")
         node_disks.append(paths)
     os_disks = [paths[0] for paths in node_disks]
-    url_text = _guest_cat(os_disks[0], "/etc/kubernetes/apiserver-url.env")
-    kubeconfig_text = _guest_cat(os_disks[0], "/etc/kubernetes/kubeconfig")
+    url_text = _guest_cat(os_disks[0], "/etc/kubernetes/apiserver-url.env", booted_deployment)
+    kubeconfig_text = _guest_cat(os_disks[0], "/etc/kubernetes/kubeconfig", booted_deployment)
     bases = compact_dns_bases_from_text(url_text + "\n" + kubeconfig_text)
     if not bases:
         sys.exit("Could not find the source cluster domain on the flavor disk")
-    macs = [_guest_mac(path) for path in os_disks]
+    macs = [_guest_mac(path, booted_deployment) for path in os_disks]
     member_ips = compact_etcd_member_ips(
-        _guest_cat(os_disks[0], "/etc/kubernetes/manifests/etcd-pod.yaml"))
+        _guest_cat(os_disks[0], "/etc/kubernetes/manifests/etcd-pod.yaml", booted_deployment))
     source_api_vip, source_ingress_vip = compact_vips_from_nodeip_service(
-        _guest_cat(os_disks[0], "/etc/systemd/system/nodeip-configuration.service"))
+        _guest_cat(os_disks[0], "/etc/systemd/system/nodeip-configuration.service", booted_deployment))
     source = compact_source_from_layout(
         flavor, macs, bases, node_disks, node_ips=member_ips,
         api_vip=source_api_vip, ingress_vip=source_ingress_vip)
     kubeconfig = _guest_cat(
         os_disks[0],
-        "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig")
+        "/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig",
+        booted_deployment)
     if resume not in ("recert", "rewrite", "health"):
         requested_subnet = subnet
         subnet = record_compact_clone(clone_id, subnet, flavor_name)
@@ -5451,11 +5527,13 @@ def run_compact_from_flavor(
         by_role = {node["role"]: node for node in nodes}
         api_ip = by_role[QUORUM_ETCD_ROLE]["ip"]
         _clone_log(work, f"resume at {resume}")
-        return _finish_compact_clone(
+        health = _finish_compact_clone(
             source, clone_id, nodes, identity, work, crypto, flavor["etcd_image"], ingress_cn,
             "/out/summary.txt", by_role, api_ip, f"{work}/source.kubeconfig", pairs,
             start_at=None if resume == "recert" else resume,
             pull_secret=pull_secret)
+        mark_compact_clone_running(clone_id)
+        return health
     flavor_crypto = flavor_crypto_dir(flavor_name)
     env.run(
         f"mkdir -p {shlex.quote(crypto)} && chmod 700 {shlex.quote(crypto)} && "
@@ -5468,7 +5546,9 @@ def run_compact_from_flavor(
     env.run(f"test -s {shlex.quote(identity)}")
     env.run(f"chmod 600 {shlex.quote(identity)}")
     _clone_log(work, "copy the etcd database out of the flavor disk")
-    env.run(f"mkdir -p {shlex.quote(work + '/snapshot-src')}")
+    env.run(
+        f"mkdir -p {shlex.quote(work + '/snapshot-src')} && "
+        f"chmod 700 {shlex.quote(work + '/snapshot-src')}")
     copied = env.run(
         f"guestfish --ro -a {shlex.quote(os_disks[1])} -m {shlex.quote(RHCOS_ROOT_MOUNT)} "
         f"copy-out {shlex.quote(RHCOS_ETCD_DB)} {shlex.quote(work + '/snapshot-src')}",
@@ -5477,7 +5557,7 @@ def run_compact_from_flavor(
         sys.exit(f"Could not copy the etcd database from {os_disks[1]}. {(copied.stderr or '').strip()}")
     env.run(
         f"mv {shlex.quote(work + '/snapshot-src/db')} {shlex.quote(work + '/snapshot.db')} && "
-        f"rmdir {shlex.quote(work + '/snapshot-src')} && chmod 644 {shlex.quote(work + '/snapshot.db')}")
+        f"rmdir {shlex.quote(work + '/snapshot-src')} && chmod 600 {shlex.quote(work + '/snapshot.db')}")
     _clone_log(work, "read etcd signer keys from the snapshot")
     _write_etcd_signers(f"{work}/snapshot.db", crypto)
     disk_count = sum(len(paths) for paths in node_disks)
@@ -5486,10 +5566,12 @@ def run_compact_from_flavor(
         env.run(command)
     memory_kib = memory_kib or flavor["memory_kib"]
     vcpus = vcpus or flavor["vcpus"]
-    return _start_compact_clone(
+    health = _start_compact_clone(
         source, clone_id, subnet, nodes, macs, identity, work, crypto,
         flavor["etcd_image"], ingress_cn, memory_kib, vcpus,
         skip_hash_check=True, pull_secret=pull_secret)
+    mark_compact_clone_running(clone_id)
+    return health
 
 
 def cmd_compact_boot(args):
@@ -5555,10 +5637,12 @@ def run_compact_clone(source, clone_id, subnet, identity, memory_kib=None, vcpus
         etcd_image = image_r.stdout.strip()
         pairs = compact_identity_pairs(source, clone_id, nodes)
         _clone_log(work, f"resume at {resume}")
-        return _finish_compact_clone(
+        health = _finish_compact_clone(
             source, clone_id, nodes, identity, work, crypto, etcd_image, ingress_cn,
             plan_path, by_role, api_ip, src_kc, pairs,
             start_at={"heal": "rewrite", "health": "health"}.get(resume))
+        mark_compact_clone_running(clone_id)
+        return health
 
     env.run(
         f"mkdir -p {shlex.quote(crypto)} && chmod 755 {shlex.quote(work)} && chmod 700 {shlex.quote(crypto)}")
@@ -5600,7 +5684,7 @@ def run_compact_clone(source, clone_id, subnet, identity, memory_kib=None, vcpus
     etcd_image = image_r.stdout.strip()
     if not etcd_image:
         sys.exit("Could not read the etcd image from the source")
-    _vm(src_pin, "sudo rm -rf /var/tmp/ct-snapshot && sudo mkdir -p /var/tmp/ct-snapshot && sudo chmod 755 /var/tmp/ct-snapshot", identity)
+    _vm(src_pin, "sudo rm -rf /var/tmp/ct-snapshot && sudo mkdir -p /var/tmp/ct-snapshot && sudo chmod 700 /var/tmp/ct-snapshot", identity)
     _vm(src_pin, " ".join([
         "sudo podman run --rm --network host --privileged",
         "--authfile /var/lib/kubelet/config.json",
@@ -5613,19 +5697,22 @@ def run_compact_clone(source, clone_id, subnet, identity, memory_kib=None, vcpus
         "--key /certs/secrets/etcd-all-certs/etcd-peer-master-0-1.key",
         "snapshot save /out/snapshot.db",
     ]), identity)
-    _vm(src_pin, "sudo chmod 644 /var/tmp/ct-snapshot/snapshot.db", identity)
+    _vm(src_pin, "sudo chown core:core /var/tmp/ct-snapshot/snapshot.db && sudo chmod 600 /var/tmp/ct-snapshot/snapshot.db", identity)
     env.run(
         "scp " + " ".join(SSH_OPTS) + f" -i {shlex.quote(identity)} "
         f"core@{src_pin}:/var/tmp/ct-snapshot/snapshot.db {shlex.quote(work + '/snapshot.db')}")
+    env.run(f"chmod 600 {shlex.quote(work + '/snapshot.db')}")
     _vm(src_pin, "sudo rm -rf /var/tmp/ct-snapshot", identity, check=False)
 
     _clone_log(work, "reflink-copy the three source disks")
     for command in compact_copy_commands(disks):
         env.run(command)
 
-    _start_compact_clone(
+    health = _start_compact_clone(
         source, clone_id, subnet, nodes, macs, identity, work, crypto,
         etcd_image, ingress_cn, memory_kib, vcpus)
+    mark_compact_clone_running(clone_id)
+    return health
 
 
 
@@ -5981,13 +6068,93 @@ def define_compact_libvirt(plan, emulator, machine_type, memory_kib, vcpus):
         env.run(f"virsh define {shlex.quote(path)}")
 
 
+def compact_domain_owned_by_clone(xml, clone_id, role):
+    """Check that a named compact guest only uses this clone's disk paths."""
+    root = ET.fromstring(xml)
+    if root.findtext("name") != f"test-infra-cluster-{clone_id}-{role}":
+        return False
+    paths = []
+    for disk in root.findall("./devices/disk"):
+        if disk.get("device") != "disk":
+            continue
+        source = disk.find("source")
+        if source is None:
+            return False
+        path = source.get("file") or source.get("dev")
+        if not path:
+            return False
+        paths.append(os.path.normpath(path))
+    allowed = {
+        os.path.normpath(compact_role_disk_dest(clone_id, role, 0)),
+        os.path.normpath(compact_role_disk_dest(clone_id, role, 1)),
+        os.path.normpath(f"/var/lib/libvirt/images/{clone_id}-{role}.qcow2"),
+    }
+    return bool(paths) and set(paths).issubset(allowed)
+
+
+def compact_network_owned_by_clone(xml, clone_id):
+    """Check the bridge and fixed node leases before removing a compact network."""
+    root = ET.fromstring(xml)
+    if root.findtext("name") != f"test-infra-net-{clone_id}":
+        return False
+    bridge = root.find("bridge")
+    if bridge is None or bridge.get("name") != compact_bridge_name(clone_id):
+        return False
+    try:
+        hosts = parse_dhcp_hosts(xml)
+    except ValueError:
+        return False
+    gateway = root.find(".//ip[@family='ipv4']")
+    if gateway is None:
+        gateway = root.find(".//ip")
+    if gateway is None or not gateway.get("address"):
+        return False
+    try:
+        gateway_ip = ipaddress.ip_address(gateway.get("address"))
+    except ValueError:
+        return False
+    if not isinstance(gateway_ip, ipaddress.IPv4Address):
+        return False
+    subnet = str(gateway_ip).split(".")[2]
+    expected = {
+        (f"test-infra-cluster-{clone_id}-{role}", f"192.168.{subnet}.{suffix}")
+        for role, suffix in zip(COMPACT_ROLES, COMPACT_NODE_SUFFIXES)
+    }
+    present = {(host.get("name"), host.get("ip")) for host in hosts}
+    return len(expected) == len(COMPACT_ROLES) and expected.issubset(present)
+
+
+def require_compact_libvirt_ownership(clone_id):
+    """Refuse cleanup if a clone's recorded libvirt names point elsewhere."""
+    names = env.run("virsh list --all --name", check=False)
+    if names.returncode != 0:
+        sys.exit("Could not inspect compact clone domains before destroy")
+    domains = set(names.stdout.split())
+    for role in COMPACT_ROLES:
+        name = f"test-infra-cluster-{clone_id}-{role}"
+        if name not in domains:
+            continue
+        xml = env.run(f"virsh dumpxml {shlex.quote(name)}", check=False)
+        if xml.returncode != 0 or not compact_domain_owned_by_clone(xml.stdout, clone_id, role):
+            sys.exit(f"Refusing to destroy {name}: its disk ownership does not match clone '{clone_id}'")
+
+    networks = env.run("virsh net-list --all --name", check=False)
+    if networks.returncode != 0:
+        sys.exit("Could not inspect compact clone networks before destroy")
+    network = f"test-infra-net-{clone_id}"
+    if network in networks.stdout.split():
+        xml = env.run(f"virsh net-dumpxml {shlex.quote(network)}", check=False)
+        if xml.returncode != 0 or not compact_network_owned_by_clone(xml.stdout, clone_id):
+            sys.exit(f"Refusing to destroy network {network}: it does not match clone '{clone_id}'")
+
+
 def undefine_compact_libvirt(clone_id):
-    """Destroy and undefine the compact guests and their network."""
+    """Destroy only compact guests and network proven to belong to this clone."""
+    require_compact_libvirt_ownership(clone_id)
     for role in COMPACT_ROLES:
         domain = f"test-infra-cluster-{clone_id}-{role}"
         env.run(f"virsh destroy {shlex.quote(domain)}", check=False)
         env.run(f"virsh undefine {shlex.quote(domain)}", check=False)
-        env.run(f"rm -f {shlex.quote(f'/var/lib/libvirt/images/{clone_id}-{role}.qcow2')}", check=False)
         env.run(f"rm -f {shlex.quote(compact_role_disk_dest(clone_id, role, 0))}", check=False)
         env.run(f"rm -f {shlex.quote(compact_role_disk_dest(clone_id, role, 1))}", check=False)
     net = f"test-infra-net-{clone_id}"
@@ -6349,6 +6516,11 @@ def cmd_snapshot(args):
     if vm_state != "running":
         sys.exit(f"Source VM '{vm_name}' is '{vm_state}', expected 'running'")
 
+    status = env.run_vm(vm_ip, "sudo ostree admin status", check=False)
+    if status.returncode != 0:
+        sys.exit("Could not read the booted OSTree deployment from the source VM")
+    rhcos_deployment = parse_booted_ostree_deployment(status.stdout)
+
     print(f"Creating snapshot flavor '{flavor_name}' from {vm_name}...")
 
     print_step(1, 11, "Detecting etcd image")
@@ -6472,6 +6644,7 @@ def cmd_snapshot(args):
             "vcpus": dominfo["vcpus"],
             "disks": [f"disk-{i}.qcow2" for i in range(len(disks))],
             "etcd_image": etcd_image,
+            "rhcos_deployment": rhcos_deployment,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
     print(f"\nFlavor '{flavor_name}' created at {fdir}")

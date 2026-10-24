@@ -1245,6 +1245,16 @@ class TestCompactInspect(unittest.TestCase):
         self.assertEqual(records[0]["name"], "api.test-infra-cluster-mno2.redhat.com")
         self.assertEqual(len(records), 3)
 
+    def test_dhcp_host_ips_must_be_valid_ipv4(self):
+        with self.assertRaises(ValueError):
+            ct.parse_dhcp_hosts(
+                "<network><ip><dhcp><host mac='02:00:00:00:00:01' "
+                "ip='192.168.1.1;touch /tmp/pwned'/></dhcp></ip></network>")
+        with self.assertRaises(ValueError):
+            ct.parse_dhcp_hosts(
+                "<network><ip><dhcp><host mac='02:00:00:00:00:01' "
+                "ip='2001:db8::1'/></dhcp></ip></network>")
+
     def test_discover_compact_source_reads_three_domains(self):
         ct.env = ct.ExecutionEnv(host="root@sealusa46", host_ip="10.0.0.1")
 
@@ -1321,6 +1331,51 @@ class TestCompactInspect(unittest.TestCase):
         self.assertIn(f"<bridge name='{ct.compact_bridge_name('aabbccdd')}'", xml)
         self.assertNotEqual(ct.compact_bridge_name("compact-a"), ct.compact_bridge_name("compact-b"))
         self.assertLessEqual(len(ct.compact_bridge_name("compact-a")), 15)
+
+    def test_compact_libvirt_names_are_checked_before_reservation(self):
+        ct.env = ct.ExecutionEnv(host="root@host", host_ip="10.0.0.1")
+        def fake_run(cmd, check=True):
+            result = MagicMock(returncode=0, stdout="", stderr="")
+            if cmd == "virsh list --all --name":
+                result.stdout = "test-infra-cluster-edge7-master-0-1\n"
+            return result
+        with patch.object(ct.env, "run", side_effect=fake_run):
+            conflicts = ct.compact_libvirt_conflicts("edge7")
+            self.assertEqual(conflicts, ["test-infra-cluster-edge7-master-0-1"])
+            with self.assertRaises(SystemExit) as ctx:
+                ct.require_compact_libvirt_names_free("edge7")
+        self.assertIn("no resources were changed", str(ctx.exception))
+
+    def test_destroy_ownership_requires_clone_disk_and_network_identity(self):
+        clone_id = "edge7"
+        nodes = ct.compact_node_plan(clone_id, 207, [
+            "02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:03"])
+        vm_xml = ct.gen_compact_vm_xml(
+            clone_id, nodes[0], [ct.compact_role_disk_dest(clone_id, nodes[0]["role"], 0)])
+        net_xml = ct.gen_compact_network_xml(clone_id, 207, nodes)
+        self.assertTrue(ct.compact_domain_owned_by_clone(vm_xml, clone_id, nodes[0]["role"]))
+        self.assertTrue(ct.compact_network_owned_by_clone(net_xml, clone_id))
+        foreign_xml = vm_xml.replace(
+            ct.compact_role_disk_dest(clone_id, nodes[0]["role"], 0),
+            "/var/lib/libvirt/images/source-master.qcow2")
+        self.assertFalse(ct.compact_domain_owned_by_clone(foreign_xml, clone_id, nodes[0]["role"]))
+        foreign_net = net_xml.replace(ct.compact_bridge_name(clone_id), "source-bridge")
+        self.assertFalse(ct.compact_network_owned_by_clone(foreign_net, clone_id))
+
+    def test_mark_compact_clone_running_only_updates_reserved_clone(self):
+        saved = {"state": {"flavors": {}, "clones": {
+            "edge7": {"topology": "compact", "status": "booting"}}}}
+        class _State:
+            def __enter__(self):
+                return saved["state"]
+            def __exit__(self, *args):
+                return False
+        with patch.object(ct, "locked_state", _State):
+            ct.mark_compact_clone_running("edge7")
+        self.assertEqual(saved["state"]["clones"]["edge7"]["status"], "running")
+        with patch.object(ct, "locked_state", _State):
+            with self.assertRaises(SystemExit):
+                ct.mark_compact_clone_running("missing")
 
     def test_compact_vm_xml_uses_one_nic_and_virtio_disk(self):
         nodes = ct.compact_node_plan("aabbccdd", 200, [
@@ -2672,9 +2727,9 @@ class TestCompactInspect(unittest.TestCase):
 
     def test_nm_mac_and_etcd_secret_pem_extraction(self):
         self.assertEqual(ct.parse_nm_mac("mac-address=52:54:00:76:07:C5\n"), "52:54:00:76:07:c5")
-        fixture_key = _fixture_pem("PRIVATE KEY", "NOT-A-KEY")
+        fixture_key = _fixture_pem("TEST FIXTURE KEY", "NOT-A-KEY")
         fixture_cert = _fixture_pem("CERTIFICATE", "NOT-A-CERT")
-        other_key = _fixture_pem("PRIVATE KEY", "OTHER")
+        other_key = _fixture_pem("OTHER TEST FIXTURE KEY", "OTHER")
         blob = (
             b"noise /kubernetes.io/secrets/openshift-etcd/etcd-signer "
             + fixture_cert + b"\n" + fixture_key
@@ -2711,12 +2766,14 @@ class TestCompactInspect(unittest.TestCase):
             def __exit__(self, *args):
                 return False
 
-        with patch.object(ct, "locked_state", _State):
+        with patch.object(ct, "locked_state", _State), \
+             patch.object(ct, "require_compact_libvirt_names_free"):
             ct.record_compact_clone("edge2", 201, "mno-3node")
         info = saved["state"]["clones"]["edge2"]
         self.assertEqual(info["topology"], "compact")
         self.assertEqual(info["subnet_primary"], 201)
-        with patch.object(ct, "locked_state", _State):
+        with patch.object(ct, "locked_state", _State), \
+             patch.object(ct, "require_compact_libvirt_names_free"):
             with self.assertRaises(SystemExit):
                 ct.record_compact_clone("edge3", 201, "mno-3node")
 
@@ -3172,9 +3229,26 @@ class TestCompactInspect(unittest.TestCase):
         self.assertNotIn("192.168.", text)
         self.assertNotIn("02:00", text)
 
-    def test_rhcos_deploy_ignores_origin_files(self):
+    def test_rhcos_deploy_uses_booted_ostree_status(self):
         names = ["abc.0.origin", "abc.0", "def.1"]
-        self.assertEqual(ct.choose_rhcos_deploy(names), "def.1")
+        self.assertEqual(ct.choose_rhcos_deploy(names, "abc.0"), "abc.0")
+        self.assertEqual(ct.choose_rhcos_deploy(["only.0", "only.0.origin"]), "only.0")
+        with self.assertRaises(SystemExit) as ctx:
+            ct.choose_rhcos_deploy(names)
+        self.assertIn("multiple RHCOS deployments", str(ctx.exception))
+        self.assertEqual(
+            ct.parse_booted_ostree_deployment("* rhcos abcdef0123456789.0\n  rhcos 123456789abcdef0.0\n"),
+            "abcdef0123456789.0")
+
+    def test_identity_rewrite_preserves_pem_only_input_exactly(self):
+        pem_only = (
+            "bundle: |\n"
+            "  -----BEGIN CERTIFICATE-----\n"
+            "  MIIB\n"
+            "  -----END CERTIFICATE-----\n")
+        self.assertEqual(
+            ct.apply_identity_preserving_pems(pem_only, [("unused", "replacement")]),
+            pem_only)
 
 
 class TestFlavorState(unittest.TestCase):
@@ -3255,6 +3329,8 @@ class TestSnapshot(unittest.TestCase):
                 r.stdout = ""
             elif "virsh domstate" in cmd:
                 r.stdout = "shut off" if shutdown_called["v"] else "running"
+            elif "ostree admin status" in cmd:
+                r.stdout = "* rhcos abcdef0123456789.0\n  rhcos 0123456789abcdef.0\n"
             elif "ingress-cn" in cmd or "subject" in cmd:
                 r.stdout = "fake-ingress-cn"
             elif "python3" in cmd and "etcd" in cmd:
@@ -3304,6 +3380,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(flavor["vcpus"], 16)
         self.assertEqual(flavor["memory_kib"], 67108864)
         self.assertEqual(flavor["disks"], ["disk-0.qcow2"])
+        self.assertEqual(flavor["rhcos_deployment"], "abcdef0123456789.0")
 
     @patch("time.sleep")
     def test_snapshot_existing_flavor_exits(self, _):
