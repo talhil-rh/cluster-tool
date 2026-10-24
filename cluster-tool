@@ -1892,6 +1892,110 @@ def compact_etcd_force_redeploy_patch(reason):
     return {"spec": {"forceRedeploymentReason": reason}}
 
 
+COMPACT_MASTER_LEASE_PREFIX = "/kubernetes.io/masterleases/"
+
+
+def compact_stale_master_lease_keys(keys_output, node_ips):
+    """Return API-server lease keys that do not belong to this compact clone."""
+    clone_ips = {ipaddress.ip_address(ip) for ip in node_ips}
+    stale = set()
+    for line in (keys_output or "").splitlines():
+        key = line.strip()
+        if not key:
+            continue
+        if not key.startswith(COMPACT_MASTER_LEASE_PREFIX):
+            continue
+        value = key[len(COMPACT_MASTER_LEASE_PREFIX):]
+        try:
+            lease_ip = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid API-server master lease key: {key}") from exc
+        if not isinstance(lease_ip, ipaddress.IPv4Address):
+            raise ValueError(f"Invalid API-server master lease key: {key}")
+        if lease_ip not in clone_ips:
+            stale.add(key)
+    return sorted(stale)
+
+
+def compact_master_lease_etcd_command(etcd_image, nodes, action, key=None):
+    """Build an etcdctl command for reading or deleting compact API-server leases."""
+    if action not in ("list", "delete"):
+        raise ValueError(f"Unsupported master lease action: {action}")
+    if action == "delete" and (
+            not key or not key.startswith(COMPACT_MASTER_LEASE_PREFIX)):
+        raise ValueError("A full API-server master lease key is required for deletion")
+    endpoints = ",".join(f"https://{node['ip']}:2379" for node in nodes)
+    peer = QUORUM_ETCD_ROLE
+    parts = [
+        "sudo podman run --rm --network host --privileged",
+        "--authfile /var/lib/kubelet/config.json",
+        "-v /etc/kubernetes/static-pod-resources/etcd-certs:/certs:ro",
+        "--entrypoint etcdctl", shlex.quote(etcd_image),
+        f"--endpoints={shlex.quote(endpoints)}",
+        "--cacert /certs/configmaps/etcd-all-bundles/server-ca-bundle.crt",
+        f"--cert /certs/secrets/etcd-all-certs/etcd-peer-{peer}.crt",
+        f"--key /certs/secrets/etcd-all-certs/etcd-peer-{peer}.key",
+    ]
+    if action == "list":
+        parts.append(f"get --prefix --keys-only {COMPACT_MASTER_LEASE_PREFIX}")
+    else:
+        parts.append("del " + shlex.quote(key))
+    return " ".join(parts)
+
+
+def _clear_compact_stale_master_leases(nodes, identity, etcd_image, work):
+    """Remove source-cluster API leases from the clone's restored etcd state."""
+    node_ips = [node["ip"] for node in nodes]
+    lease_node = next(
+        (node for node in nodes if node["role"] == QUORUM_ETCD_ROLE), nodes[0])
+    list_command = compact_master_lease_etcd_command(etcd_image, nodes, "list")
+    listed = _vm(lease_node["ip"], list_command, identity, check=False)
+    if listed.returncode != 0:
+        detail = (listed.stderr or listed.stdout or "etcdctl returned a non-zero status").strip()
+        sys.exit(
+            "Could not inspect API-server master leases in the clone etcd cluster: "
+            f"{detail}. Log: {work}/clone.log")
+    try:
+        stale = compact_stale_master_lease_keys(listed.stdout, node_ips)
+    except ValueError as exc:
+        sys.exit(f"Could not safely classify clone API-server master leases: {exc}")
+
+    if not stale:
+        _clone_log(work, "clone etcd master leases contain only clone API addresses")
+        return
+
+    _clone_log(
+        work,
+        "removing stale source API-server master leases: " + ", ".join(stale))
+    for key in stale:
+        deleted = _vm(
+            lease_node["ip"],
+            compact_master_lease_etcd_command(etcd_image, nodes, "delete", key),
+            identity, check=False)
+        if deleted.returncode != 0:
+            detail = (deleted.stderr or deleted.stdout or "etcdctl returned a non-zero status").strip()
+            sys.exit(
+                f"Could not remove stale API-server master lease {key}: {detail}. "
+                f"Log: {work}/clone.log")
+
+    verified = _vm(lease_node["ip"], list_command, identity, check=False)
+    if verified.returncode != 0:
+        detail = (verified.stderr or verified.stdout or "etcdctl returned a non-zero status").strip()
+        sys.exit(
+            "Could not verify API-server master lease cleanup in the clone etcd cluster: "
+            f"{detail}. Log: {work}/clone.log")
+    try:
+        remaining = compact_stale_master_lease_keys(verified.stdout, node_ips)
+    except ValueError as exc:
+        sys.exit(f"Could not verify clone API-server master leases: {exc}")
+    if remaining:
+        sys.exit(
+            "Stale source API-server master leases remain in clone etcd: "
+            + ", ".join(remaining)
+            + f". Log: {work}/clone.log")
+    _clone_log(work, f"verified removal of {len(stale)} stale API-server master lease(s)")
+
+
 def compact_etcd_secret_patch(secret_raw, pems):
     """Replace PEM keys that already exist in an etcd secret and differ."""
     doc = json.loads(secret_raw)
@@ -3580,6 +3684,8 @@ def _finish_compact_clone(
     api_vip = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
     desired_master_render = ""
     expected_api_url = ""
+    _clone_log(work, "remove stale source API-server leases from clone etcd")
+    _clear_compact_stale_master_leases(nodes, identity, etcd_image, work)
     if start_at == "health":
         loaded = _load_revision_baselines(work)
         if loaded is None:

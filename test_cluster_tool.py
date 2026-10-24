@@ -1728,6 +1728,50 @@ class TestCompactInspect(unittest.TestCase):
             "etcd-master-0-1 0/5 Pending 0 1m\n"
             "etcd-guard-master-0-0 1/1 Running 0 1m\n"), 1)
 
+    def test_compact_master_lease_cleanup_keeps_clone_ips_only(self):
+        node_ips = [
+            "192.168.220.69",
+            "192.168.220.81",
+            "192.168.220.89",
+        ]
+        lease_keys = "\n".join([
+            "/kubernetes.io/masterleases/192.168.123.50",
+            "/kubernetes.io/masterleases/192.168.220.89",
+            "/kubernetes.io/masterleases/192.168.220.69",
+            "/kubernetes.io/masterleases/192.168.123.64",
+            "/kubernetes.io/masterleases/192.168.220.81",
+        ])
+
+        self.assertEqual(ct.compact_stale_master_lease_keys(lease_keys, node_ips), [
+            "/kubernetes.io/masterleases/192.168.123.50",
+            "/kubernetes.io/masterleases/192.168.123.64",
+        ])
+        self.assertEqual(ct.compact_stale_master_lease_keys("", node_ips), [])
+
+    def test_compact_master_lease_cleanup_rejects_malformed_lease_keys(self):
+        with self.assertRaises(ValueError):
+            ct.compact_stale_master_lease_keys(
+                "/kubernetes.io/masterleases/not-an-ip", ["192.168.220.69"])
+
+    def test_compact_master_lease_etcd_command_uses_clone_quorum(self):
+        nodes = [
+            {"role": "master-0-0", "ip": "192.168.220.69"},
+            {"role": "master-0-1", "ip": "192.168.220.81"},
+            {"role": "master-0-2", "ip": "192.168.220.89"},
+        ]
+        command = ct.compact_master_lease_etcd_command(
+            "quay.io/openshift/etcd:latest", nodes, "delete",
+            "/kubernetes.io/masterleases/192.168.123.50")
+        self.assertIn("https://192.168.220.69:2379", command)
+        self.assertIn("https://192.168.220.81:2379", command)
+        self.assertIn("https://192.168.220.89:2379", command)
+        self.assertIn("--entrypoint etcdctl", command)
+        self.assertIn("etcd-peer-master-0-1.crt", command)
+        self.assertIn("del /kubernetes.io/masterleases/192.168.123.50", command)
+        with self.assertRaises(ValueError):
+            ct.compact_master_lease_etcd_command(
+                "quay.io/openshift/etcd:latest", nodes, "delete", "not-a-lease-key")
+
     def test_etcd_bundle_update_is_ordered_and_fail_closed(self):
         source = inspect.getsource(ct._finish_compact_clone)
         sign = source.index("sign kubelet certificates with the live CSR signer")
