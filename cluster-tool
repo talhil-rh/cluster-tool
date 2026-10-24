@@ -1164,6 +1164,48 @@ def compact_machineconfig_has_clone_api_url(raw, clone_domain):
         "/etc/kubernetes/apiserver-url.env", "")
     wanted = f"KUBERNETES_SERVICE_HOST='api-int.{clone_domain}'"
     return name.startswith("rendered-master-") and wanted in api_url.splitlines()
+
+
+def compact_machineconfig_input_has_clone_api_url(raw, clone_domain):
+    """Whether a source MachineConfig contains this clone's API URL."""
+    try:
+        doc = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(doc, dict):
+        return False
+    api_url = rendered_machineconfig_files(doc).get(
+        "/etc/kubernetes/apiserver-url.env", "")
+    wanted = f"KUBERNETES_SERVICE_HOST='api-int.{clone_domain}'"
+    return wanted in api_url.splitlines()
+
+
+def compact_controllerconfig_infra_matches(raw, clone_domain, api_vip, subnet):
+    """Whether the MCO's embedded Infrastructure snapshot matches this clone."""
+    try:
+        doc = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(doc, dict):
+        return False
+    infra = ((doc.get("spec") or {}).get("infra") or {})
+    status = infra.get("status") or {}
+    baremetal = ((status.get("platformStatus") or {}).get("baremetal") or {})
+    spec_baremetal = (((infra.get("spec") or {}).get("platformSpec") or {})
+                      .get("baremetal") or {})
+    # clone_domain is the complete cluster domain, for example
+    # test-infra-cluster-edge21.redhat.com.
+    expected_domain = clone_domain
+    network = f"192.168.{subnet}.0/24"
+    return (
+        status.get("apiServerInternalURI") == f"https://api-int.{expected_domain}:6443"
+        and status.get("apiServerURL") == f"https://api.{expected_domain}:6443"
+        and baremetal.get("apiServerInternalIP") == api_vip
+        and baremetal.get("apiServerInternalIPs") == [api_vip]
+        and baremetal.get("machineNetworks") == [network]
+        and spec_baremetal.get("apiServerInternalIPs") == [api_vip]
+        and spec_baremetal.get("machineNetworks") == [network]
+    )
 HEAL_NODE_FILES = (
     "/var/lib/kubelet/kubeconfig",
     "/etc/kubernetes/kubeconfig",
@@ -2296,8 +2338,31 @@ def _ensure_api_certificates(oc, work, domain, api_ip, nodes, identity):
 
 
 def _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity):
-    """Restart the cert controller and wait until the API presents the clone name."""
+    """Refresh the internal API certificate before kubelets need the clone API."""
     hostname = f"api-int.{domain}"
+    secret = "internal-loadbalancer-serving-certkey"
+    cert_check = f"{work}/internal-api-serving-cert-check.crt"
+
+    def secret_has_clone_cert():
+        extracted = env.run(
+            f"rm -f {shlex.quote(cert_check)} && "
+            f"{oc} extract secret/{secret} -n openshift-kube-apiserver "
+            f"--keys=tls.crt --to=- > {shlex.quote(cert_check)}",
+            check=False)
+        if extracted.returncode != 0:
+            return False
+        env.run(f"chmod 600 {shlex.quote(cert_check)}", check=False)
+        return (
+            hostname in _secret_hostnames(oc, secret)
+            and _certificate_file_has_san(cert_check, hostname))
+
+    def api_vip_has_clone_cert():
+        return presented_san_matches(_presented_san(api_ip, hostname), hostname)
+
+    if secret_has_clone_cert() and api_vip_has_clone_cert():
+        _clone_log(work, "API internal serving certificate already presents the clone name")
+        return
+
     _clone_log(work, "restart the API cert controller so it re-reads the clone API name")
     _in_parallel(nodes, lambda node: _vm(
         node["ip"], compact_restart_cert_controller_command(), identity, check=False))
@@ -2309,29 +2374,37 @@ def _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity)
         _clone_log(work, "released the cert controller lease")
     else:
         _clone_log(work, "cert controller lease was not deleted; leader election waits for the old lease")
+    secret_deadline = time.monotonic() + 90
     matched = False
-    for _ in range(48):
-        if hostname in _secret_hostnames(oc, "internal-loadbalancer-serving-certkey"):
+    while time.monotonic() < secret_deadline:
+        if secret_has_clone_cert():
             matched = True
             break
-        time.sleep(5)
+        time.sleep(min(5, max(0, secret_deadline - time.monotonic())))
     if not matched:
         sys.exit(
             f"The API cert controller did not issue a certificate for {hostname}. "
             f"Kubelet cannot trust the API, so the network rollout cannot finish. "
             f"Log: {work}/clone.log")
     _clone_log(work, "API certificate secret has the clone name")
-    for attempt in range(3):
-        if presented_san_matches(_presented_san(api_ip, hostname), hostname):
+    _clone_log(work, "reload API servers so the API VIP serves the clone certificate")
+    _in_parallel(nodes, lambda node: _vm(
+        node["ip"], compact_reload_apiserver_script(), identity, check=False))
+    api_deadline = time.monotonic() + 90
+    while time.monotonic() < api_deadline:
+        if api_vip_has_clone_cert():
             _clone_log(work, "API certificate presents the clone name")
             return
-        if attempt == 0:
-            for node in nodes:
-                _vm(node["ip"], compact_reload_apiserver_script(), identity, check=False)
-        time.sleep(5)
+        time.sleep(min(5, max(0, api_deadline - time.monotonic())))
     sys.exit(
         f"The API certificate for {hostname} was issued but the apiserver is not presenting it. "
         f"Log: {work}/clone.log")
+
+
+def _recover_compact_api_certificates(oc, work, domain, api_ip, nodes, identity):
+    """Install the clone certs, then refresh the cert controller and API VIP."""
+    _ensure_api_certificates(oc, work, domain, api_ip, nodes, identity)
+    _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity)
 
 
 def compact_lb_cert_script(hostname, ip, signer_dir, out_dir):
@@ -2957,7 +3030,6 @@ def _set_node_identity_webhook(clone_oc, policy):
 
 def _publish_clone_addresses(clone_oc, nodes, pairs):
     """Publish clone addresses on the node, machine, and baremetal host."""
-    _set_node_identity_webhook(clone_oc, "Ignore")
     for node in nodes:
         env.run(
             f"{clone_oc} patch node {shlex.quote(node['role'])} --subresource=status --type=merge "
@@ -3248,8 +3320,24 @@ def _refresh_compact_kubernetes_endpoints(
     identity_ok, detail = compact_kubernetes_endpoints_ready(
         endpoint_raw, slice_raw, node_ips, require_ready=False)
     if identity_ok:
-        _clone_log(work, "Kubernetes service endpoints already match clone addresses")
-        return True
+        time.sleep(min(5, max(0, deadline - time.monotonic())))
+        verified_endpoints, verified_slice = _read_compact_kubernetes_endpoints(clone_oc)
+        readable, read_detail = compact_kubernetes_endpoint_observation(
+            verified_endpoints, verified_slice)
+        if readable:
+            identity_ok, detail = compact_kubernetes_endpoints_ready(
+                verified_endpoints.stdout or "", verified_slice.stdout or "", node_ips,
+                require_ready=False)
+            if identity_ok:
+                _clone_log(work, "Kubernetes service endpoints already match clone addresses")
+                return True
+            endpoint_raw = verified_endpoints.stdout or ""
+            slice_raw = verified_slice.stdout or ""
+        else:
+            detail = read_detail
+        _clone_log(
+            work,
+            f"Kubernetes service endpoint identity changed during stability check ({detail}); repairing")
 
     last_detail = detail
     last_managers = compact_kubernetes_endpoint_managers(endpoint_raw, slice_raw)
@@ -3310,11 +3398,27 @@ def _refresh_compact_kubernetes_endpoints(
             ready, last_detail = compact_kubernetes_endpoints_ready(
                 verified_endpoints.stdout or "", verified_slice.stdout or "", node_ips)
             if ready:
+                time.sleep(min(5, max(0, deadline - time.monotonic())))
+                stable_endpoints, stable_slice = _read_compact_kubernetes_endpoints(clone_oc)
+                stable_readable, stable_detail = compact_kubernetes_endpoint_observation(
+                    stable_endpoints, stable_slice)
+                stable = stable_readable and compact_kubernetes_endpoints_ready(
+                    stable_endpoints.stdout or "", stable_slice.stdout or "", node_ips)[0]
+                if stable:
+                    _clone_log(
+                        work,
+                        "replaced and verified Kubernetes service endpoints with "
+                        f"{len(healthy)} healthy clone API address(es)")
+                    return True
+                last_detail = (
+                    compact_kubernetes_endpoints_ready(
+                        stable_endpoints.stdout or "", stable_slice.stdout or "", node_ips)[1]
+                    if stable_readable else stable_detail)
+                verified_invalid = stable_readable
                 _clone_log(
                     work,
-                    "replaced and verified Kubernetes service endpoints with "
-                    f"{len(healthy)} healthy clone API address(es)")
-                return True
+                    f"Kubernetes endpoint repair did not persist ({last_detail}); "
+                    "checking the authoritative node addresses before retrying")
             verified_invalid = True
             last_managers = compact_kubernetes_endpoint_managers(
                 verified_endpoints.stdout or "", verified_slice.stdout or "")
@@ -3334,6 +3438,98 @@ def _refresh_compact_kubernetes_endpoints(
         f"Kubernetes endpoint convergence failed ({last_detail}); "
         f"field managers={last_managers}")
     return False if verified_invalid else None
+
+
+def _sync_compact_controllerconfig_infra(clone_oc, clone_id, subnet, work):
+    """Align the MCO's embedded Infrastructure snapshot with the live clone."""
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    api_vip = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
+    live = env.run(f"{clone_oc} get infrastructure cluster -o json", check=False)
+    if live.returncode != 0 or not (live.stdout or "").strip():
+        sys.exit(
+            "Could not read Infrastructure/cluster before MCO render. "
+            f"Log: {work}/clone.log")
+    try:
+        infra = json.loads(live.stdout)
+    except json.JSONDecodeError:
+        sys.exit(f"Infrastructure/cluster was not valid JSON. Log: {work}/clone.log")
+    if not compact_controllerconfig_infra_matches(
+        {"spec": {"infra": infra}}, domain, api_vip, subnet):
+        sys.exit(
+            "Infrastructure/cluster does not contain the clone API identity; "
+            f"refusing to change the MCO ControllerConfig. Log: {work}/clone.log")
+
+    current = env.run(
+        f"{clone_oc} get controllerconfig machine-config-controller -o json", check=False)
+    if current.returncode != 0 or not (current.stdout or "").strip():
+        sys.exit(
+            "Could not read the MCO ControllerConfig before render. "
+            f"Log: {work}/clone.log")
+    if compact_controllerconfig_infra_matches(current.stdout, domain, api_vip, subnet):
+        _clone_log(work, "MCO ControllerConfig already has clone Infrastructure identity")
+        return
+
+    embedded = {
+        key: infra[key] for key in ("apiVersion", "kind", "spec", "status")
+        if key in infra
+    }
+    patch_path = f"{work}/controllerconfig-infra.json"
+    env.write_file(patch_path, json.dumps({"spec": {"infra": embedded}}))
+    patched = env.run(
+        f"{clone_oc} patch controllerconfig machine-config-controller --type=merge "
+        f"--patch-file {shlex.quote(patch_path)}", check=False)
+    if patched.returncode != 0:
+        detail = (patched.stderr or "").strip()
+        sys.exit(
+            "Could not align MCO ControllerConfig with Infrastructure/cluster"
+            + (f": {detail}" if detail else "")
+            + f". Log: {work}/clone.log")
+    verified = env.run(
+        f"{clone_oc} get controllerconfig machine-config-controller -o json", check=False)
+    if (verified.returncode != 0 or not (verified.stdout or "").strip()
+            or not compact_controllerconfig_infra_matches(
+                verified.stdout, domain, api_vip, subnet)):
+        sys.exit(
+            "MCO ControllerConfig did not retain clone Infrastructure identity. "
+            f"Log: {work}/clone.log")
+    _clone_log(work, "updated MCO ControllerConfig from clone Infrastructure identity")
+
+
+def _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work, timeout_seconds=180):
+    """Wait for the MCO-owned ControllerConfig to generate clone-specific 00-master."""
+    domain = f"test-infra-cluster-{clone_id}.redhat.com"
+    api_vip = f"192.168.{subnet}.{COMPACT_API_SUFFIX}"
+    deadline = time.monotonic() + timeout_seconds
+    last_detail = "MCO source objects were not readable"
+    while time.monotonic() < deadline:
+        controller = env.run(
+            f"{clone_oc} get controllerconfig machine-config-controller -o json", check=False)
+        machineconfig = env.run(
+            f"{clone_oc} get machineconfig 00-master -o json", check=False)
+        if (controller.returncode == 0 and machineconfig.returncode == 0
+                and (controller.stdout or "").strip()
+                and (machineconfig.stdout or "").strip()):
+            controller_ready = compact_controllerconfig_infra_matches(
+                controller.stdout, domain, api_vip, subnet)
+            machineconfig_ready = compact_machineconfig_input_has_clone_api_url(
+                machineconfig.stdout, domain)
+            if controller_ready and machineconfig_ready:
+                _clone_log(work, "MCO ControllerConfig generated clone-specific 00-master")
+                return
+            last_detail = (
+                f"ControllerConfig clone identity={'ready' if controller_ready else 'pending'}, "
+                f"00-master clone API URL={'ready' if machineconfig_ready else 'pending'}")
+        else:
+            errors = "; ".join(
+                detail for detail in (
+                    (controller.stderr or "").strip(),
+                    (machineconfig.stderr or "").strip(),
+                ) if detail)
+            last_detail = errors or "MCO source objects were not readable"
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+    sys.exit(
+        f"Timed out after {timeout_seconds} seconds waiting for clone-specific MCO inputs "
+        f"({last_detail}). Log: {work}/clone.log")
 
 
 def _wait_master_render(clone_oc, previous_render):
@@ -3521,6 +3717,21 @@ def _finish_compact_clone(
         _vm(recert_node["ip"],
             "sudo cp /var/tmp/kubelet-ca.crt /etc/kubernetes/kubelet-ca.crt && sudo restorecon /etc/kubernetes/kubelet-ca.crt || true",
             identity)
+        # master-0-0 was started before its freshly signed client certificate
+        # was installed. Force kubelet to reload that file so it can register
+        # and make the MCO daemonset available before the render handoff.
+        _clone_log(work, "restart master-0-0 kubelet after installing its clone client certificate")
+        _vm(recert_node["ip"], "sudo systemctl restart kubelet", identity)
+        kubelet_ready = env.run(
+            f"{clone_oc} wait --for=condition=Ready node/{shlex.quote(recert_node['role'])} "
+            "--timeout=120s", check=False)
+        if kubelet_ready.returncode != 0:
+            detail = (kubelet_ready.stderr or kubelet_ready.stdout or "").strip()
+            sys.exit(
+                "master-0-0 did not return Ready after its kubelet certificate reload"
+                + (f": {detail}" if detail else "")
+                + f". Log: {work}/clone.log")
+        _clone_log(work, "master-0-0 kubelet is Ready with the clone client certificate")
 
     clone_kc = f"{work}/clone.kubeconfig"
     if "yes" not in env.run(f"test -f {shlex.quote(clone_kc)} && echo yes || true").stdout:
@@ -3531,15 +3742,44 @@ def _finish_compact_clone(
         work,
         f"prepared runner kubeconfig {clone_kc} server=https://{api_vip}:6443 "
         f"tls-server-name=api.{domain}")
+    if start_at != "health":
+        apiserver_revision_baseline = _load_revision_baseline(work, "kube-apiserver")
+        if start_at == "rewrite" and not _revision_int(apiserver_revision_baseline):
+            sys.exit(
+                "Cannot safely resume the rewrite without the saved pre-refresh "
+                "kube-apiserver revision baseline. Restore it from the flavor snapshot "
+                f"before retrying. Log: {work}/clone.log")
+        if start_at is None and not _revision_int(apiserver_revision_baseline):
+            apiserver_revision_baseline = _operator_latest_revision(
+                clone_oc, "kube-apiserver")
+            if not _revision_int(apiserver_revision_baseline):
+                sys.exit(
+                    "kube-apiserver revision baseline is unavailable before "
+                    "certificate refresh; refusing to continue. "
+                    f"Log: {work}/clone.log")
+            _store_revision_baseline(work, "kube-apiserver", apiserver_revision_baseline)
+            _clone_log(
+                work,
+                f"saved pre-refresh kube-apiserver revision baseline "
+                f"{apiserver_revision_baseline}")
     if start_at == "rewrite":
         etcd_revision_baseline = _load_revision_baseline(work, "etcd")
-        certs = _require_reissued_etcd_certs(clone_oc, nodes, identity, work)
-        if _revision_int(certs.get("etcd_revision_baseline")):
-            etcd_revision_baseline = certs["etcd_revision_baseline"]
-            _store_revision_baseline(work, "etcd", etcd_revision_baseline)
+        if _revision_int(etcd_revision_baseline):
+            # A saved baseline means the first pass already verified the
+            # reissued certificate inputs and triggered the etcd rollout.
+            # Reapplying them on resume can create another revision while the
+            # previous one is still converging.
+            _clone_log(
+                work,
+                "reusing saved etcd revision baseline "
+                f"{etcd_revision_baseline}; leaving the existing rollout untouched")
+        else:
+            certs = _require_reissued_etcd_certs(clone_oc, nodes, identity, work)
+            if _revision_int(certs.get("etcd_revision_baseline")):
+                etcd_revision_baseline = certs["etcd_revision_baseline"]
+                _store_revision_baseline(work, "etcd", etcd_revision_baseline)
     if start_at != "health":
         _clone_log(work, "rewrite cluster records and 00-master")
-        mc = env.run(f"{clone_oc} get machineconfig 00-master -o json", check=False)
         previous_mcp = env.run(f"{clone_oc} get mcp master -o json", check=False)
         if previous_mcp.returncode != 0 or not (previous_mcp.stdout or "").strip():
             sys.exit(f"Could not read the master MachineConfigPool before the clone rewrite. Log: {work}/clone.log")
@@ -3549,35 +3789,74 @@ def _finish_compact_clone(
             sys.exit(f"The master MachineConfigPool response was invalid JSON. Log: {work}/clone.log")
         previous_render = ((previous_mcp_doc.get("status") or {}).get("configuration") or {}).get("name", "")
         previous_desired_render = ((previous_mcp_doc.get("spec") or {}).get("configuration") or {}).get("name", "")
-        if mc.returncode != 0 or not (mc.stdout or "").strip():
-            sys.exit(f"Could not read MachineConfig 00-master before the clone rewrite. Log: {work}/clone.log")
         if not previous_render or not previous_desired_render:
             sys.exit(f"Could not read the current master render before the clone rewrite. Log: {work}/clone.log")
-        rewritten_mc = rewrite_machineconfig(mc.stdout, pairs)
-        rewritten_doc = json.loads(rewritten_mc)
-        previous_mc_doc = json.loads(mc.stdout)
-        machineconfig_spec_changed = previous_mc_doc.get("spec") != rewritten_doc.get("spec")
+
+        # Infrastructure is the source for the MCO ControllerConfig and its
+        # generated 00-master. Updating 00-master first is not durable: the MCO
+        # recreates it from ControllerConfig, which can still contain the flavor
+        # identity. Seed and verify those inputs before waiting for a render.
+        spec, status = compact_infrastructure_patches(clone_id, subnet)
+        for subresource, body in (("", spec), (" --subresource=status", status)):
+            patched = env.run(
+                f"{clone_oc} patch infrastructure cluster{subresource} --type=merge "
+                f"-p {shlex.quote(json.dumps(body))}", check=False)
+            if patched.returncode != 0:
+                detail = (patched.stderr or "").strip()
+                sys.exit(
+                    "Could not apply clone Infrastructure identity before MCO render"
+                    + (f": {detail}" if detail else "")
+                    + f". Log: {work}/clone.log")
+        _sync_compact_controllerconfig_infra(clone_oc, clone_id, subnet, work)
+
+        _clone_log(work, "publish clone node addresses before MCO render")
+        _publish_clone_addresses(clone_oc, nodes, pairs)
+        pre_render_endpoints = _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work)
+        if pre_render_endpoints is not True:
+            _clone_log(
+                work,
+                "Kubernetes API endpoints did not stabilize before MCO render; "
+                "continuing because the direct node APIs remain available")
+
+        mc = env.run(f"{clone_oc} get machineconfig 00-master -o json", check=False)
+        if mc.returncode != 0 or not (mc.stdout or "").strip():
+            sys.exit(f"Could not read MachineConfig 00-master before the clone rewrite. Log: {work}/clone.log")
+        try:
+            mc_doc = json.loads(mc.stdout)
+        except json.JSONDecodeError:
+            sys.exit(f"MachineConfig 00-master was not valid JSON. Log: {work}/clone.log")
+        owner_refs = (mc_doc.get("metadata") or {}).get("ownerReferences") or []
+        controllerconfig_owned = any(
+            owner.get("kind") == "ControllerConfig" and owner.get("controller") is True
+            for owner in owner_refs)
         existing_render_raw = ""
         existing_render_matches = False
-        if not machineconfig_spec_changed:
-            existing_render = env.run(
-                f"{clone_oc} get machineconfig {shlex.quote(previous_desired_render)} -o json",
-                check=False)
-            if existing_render.returncode == 0 and (existing_render.stdout or "").strip():
-                existing_render_raw = existing_render.stdout
-                existing_render_matches = compact_machineconfig_has_clone_api_url(
-                    existing_render_raw, domain)
-        rewritten_mc = compact_ensure_machineconfig_render_change(
-            mc.stdout, rewritten_mc, domain,
-            existing_render_raw=existing_render_raw if existing_render_matches else None)
-        env.write_file(f"{work}/00-master.json", rewritten_mc)
-        replaced = env.run(f"{clone_oc} replace -f {shlex.quote(work + '/00-master.json')}", check=False)
-        if replaced.returncode != 0:
-            detail = (replaced.stderr or "").strip()
-            sys.exit(f"Could not update MachineConfig 00-master: {detail}. Log: {work}/clone.log")
-        reuse_existing_render = (
-            not machineconfig_spec_changed and existing_render_matches
-        )
+        existing_render = env.run(
+            f"{clone_oc} get machineconfig {shlex.quote(previous_desired_render)} -o json",
+            check=False)
+        if existing_render.returncode == 0 and (existing_render.stdout or "").strip():
+            existing_render_raw = existing_render.stdout
+            existing_render_matches = compact_machineconfig_has_clone_api_url(
+                existing_render_raw, domain)
+        if controllerconfig_owned:
+            _clone_log(
+                work,
+                "00-master is ControllerConfig-managed; waiting for MCO-generated clone identity")
+            reuse_existing_render = existing_render_matches
+        else:
+            rewritten_mc = rewrite_machineconfig(mc.stdout, pairs)
+            rewritten_doc = json.loads(rewritten_mc)
+            machineconfig_spec_changed = mc_doc.get("spec") != rewritten_doc.get("spec")
+            rewritten_mc = compact_ensure_machineconfig_render_change(
+                mc.stdout, rewritten_mc, domain,
+                existing_render_raw=existing_render_raw if existing_render_matches else None)
+            env.write_file(f"{work}/00-master.json", rewritten_mc)
+            replaced = env.run(
+                f"{clone_oc} replace -f {shlex.quote(work + '/00-master.json')}", check=False)
+            if replaced.returncode != 0:
+                detail = (replaced.stderr or "").strip()
+                sys.exit(f"Could not update MachineConfig 00-master: {detail}. Log: {work}/clone.log")
+            reuse_existing_render = not machineconfig_spec_changed and existing_render_matches
 
         def apply_identity_records():
             def rewrite_object(item):
@@ -3648,11 +3927,14 @@ def _finish_compact_clone(
             ))
         _call_together(dict(preparation_steps))
 
-        # Kubelets need the clone internal API certificate to reconnect. Repair it
-        # while MCO renders so its controller can come back and publish the render.
+        # Kubelets need the clone internal API certificate to reconnect. The
+        # cert-regeneration controller must also be restarted here, before MCO
+        # can render, because its process cached the source API identity at start.
         _clone_log(work, "ensure clone API certificates while waiting for MCO render")
 
         def resolve_master_render():
+            if controllerconfig_owned:
+                _wait_compact_machineconfig_source(clone_oc, clone_id, subnet, work)
             if reuse_existing_render:
                 _clone_log(
                     work,
@@ -3670,7 +3952,7 @@ def _finish_compact_clone(
 
         parallel_results = _call_together({
             "render": resolve_master_render,
-            "api-certificates": lambda: _ensure_api_certificates(
+            "api-certificates": lambda: _recover_compact_api_certificates(
                 clone_oc, work, domain, api_vip, nodes, identity),
         })
         rendered, raw_render_text = parallel_results["render"]
@@ -3753,13 +4035,15 @@ def _finish_compact_clone(
             _vm(node["ip"], compact_release_keepalived_script(), identity, check=False)
 
         _in_parallel(nodes, refresh_node_address)
-        apiserver_revision_baseline = _operator_latest_revision(clone_oc, "kube-apiserver")
+        apiserver_revision_baseline = _load_revision_baseline(work, "kube-apiserver")
         if not _revision_int(apiserver_revision_baseline):
             sys.exit(
-                "kube-apiserver revision baseline is unavailable; refusing to continue "
-                f"without the pre-refresh revision. Log: {work}/clone.log")
-        _store_revision_baseline(work, "kube-apiserver", apiserver_revision_baseline)
-        _clone_log(work, f"kube-apiserver revision baseline {apiserver_revision_baseline}")
+                "Saved kube-apiserver revision baseline is unavailable before "
+                f"certificate refresh. Log: {work}/clone.log")
+        _clone_log(
+            work,
+            f"using pre-refresh kube-apiserver revision baseline "
+            f"{apiserver_revision_baseline}")
         _refresh_internal_api_certificate(clone_oc, work, domain, api_vip, nodes, identity)
         _clone_log(work, "replace node identity and ovnkube pods that still use the source API")
         _call_together({

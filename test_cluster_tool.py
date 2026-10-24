@@ -1543,9 +1543,11 @@ class TestCompactInspect(unittest.TestCase):
         refresh = inspect.getsource(ct._refresh_internal_api_certificate)
         stopped = refresh.index("compact_restart_cert_controller_command")
         released = refresh.index("compact_cert_controller_lease")
-        waited = refresh.index("_secret_hostnames")
+        no_op = refresh.index("if secret_has_clone_cert() and api_vip_has_clone_cert()")
         self.assertLess(stopped, released)
-        self.assertLess(released, waited)
+        self.assertLess(no_op, stopped)
+        self.assertIn("_certificate_file_has_san", refresh)
+        self.assertIn("api_deadline = time.monotonic() + 90", refresh)
         ensure = inspect.getsource(ct._ensure_api_certificates)
         self.assertLess(ensure.index("_secret_hostnames"), ensure.index("signing API serving certificates"))
         self.assertNotIn("time.sleep(10)", ensure)
@@ -1555,6 +1557,27 @@ class TestCompactInspect(unittest.TestCase):
         self.assertFalse(ct.presented_san_matches(
             "DNS:kubernetes, DNS:kubernetes.default, IP Address:172.30.0.1",
             "api-int.test-infra-cluster-aabbccdd.redhat.com"))
+
+    def test_compact_api_certificate_recovery_orders_install_before_refresh(self):
+        calls = []
+        with patch.object(ct, "_ensure_api_certificates", side_effect=lambda *args: calls.append("install")), \
+                patch.object(ct, "_refresh_internal_api_certificate", side_effect=lambda *args: calls.append("refresh")):
+            ct._recover_compact_api_certificates("oc", "/work", "example.redhat.com", "192.168.200.5", [], "key")
+        self.assertEqual(calls, ["install", "refresh"])
+
+    def test_internal_api_certificate_refresh_skips_when_vip_is_already_correct(self):
+        hostname = "api-int.test-infra-cluster-aabbccdd.redhat.com"
+        env = MagicMock()
+        env.run.return_value.returncode = 0
+        with patch.object(ct, "env", env), \
+                patch.object(ct, "_secret_hostnames", return_value=hostname), \
+                patch.object(ct, "_certificate_file_has_san", return_value=True), \
+                patch.object(ct, "_presented_san", return_value=f"DNS:{hostname}"), \
+                patch.object(ct, "_clone_log"), \
+                patch.object(ct, "_in_parallel") as parallel:
+            ct._refresh_internal_api_certificate(
+                "oc", "/work", "test-infra-cluster-aabbccdd.redhat.com", "192.168.200.5", [], "key")
+        parallel.assert_not_called()
 
     def test_clone_copy_keeps_source_disks_and_reissues_etcd_certs(self):
         source_nodes = [
@@ -1727,7 +1750,9 @@ class TestCompactInspect(unittest.TestCase):
         self.assertNotIn("_sync_reissued_etcd_certs(", source)
         self.assertNotIn("copy_to_nodes=True", source)
         self.assertNotIn("over the operator revision", source)
-        self.assertNotIn("systemctl restart kubelet", source)
+        self.assertEqual(source.count("sudo systemctl restart kubelet"), 1)
+        self.assertIn(
+            "master-0-0 kubelet after installing its clone client certificate", source)
         self.assertNotIn("systemctl restart crio", source)
         self.assertIn("publish clone node IPs without restarting kubelet", source)
         self.assertNotIn("is core-ready", source)
@@ -2057,7 +2082,10 @@ class TestCompactInspect(unittest.TestCase):
         self.assertFalse(ct.compact_install_observation_ready(
             3, True, [], [], True, endpoints_ready=False))
         finish = inspect.getsource(ct._finish_compact_clone)
-        self.assertLess(finish.index("_wait_master_render"), finish.index("_ensure_api_certificates"))
+        self.assertIn('"render": resolve_master_render', finish)
+        self.assertIn('"api-certificates": lambda: _recover_compact_api_certificates(', finish)
+        recovery = inspect.getsource(ct._recover_compact_api_certificates)
+        self.assertLess(recovery.index("_ensure_api_certificates"), recovery.index("_refresh_internal_api_certificate"))
         self.assertNotIn("time.sleep(30)", finish)
 
     def test_health_resume_requires_saved_revision_baselines(self):
@@ -2386,6 +2414,52 @@ class TestCompactInspect(unittest.TestCase):
         self.assertEqual(second_source, first_source)
         self.assertEqual(
             ct.rendered_machineconfig_files(first_doc)["/etc/kubernetes/apiserver-url.env"], body)
+
+    def test_compact_mco_source_identity_matches_clone_infrastructure(self):
+        domain = "test-infra-cluster-edge21.redhat.com"
+        api_vip = "192.168.221.5"
+        subnet = 221
+        infra = {
+            "apiVersion": "config.openshift.io/v1",
+            "kind": "Infrastructure",
+            "spec": {"platformSpec": {"baremetal": {
+                "apiServerInternalIPs": [api_vip],
+                "machineNetworks": ["192.168.221.0/24"],
+            }}},
+            "status": {
+                "apiServerInternalURI": f"https://api-int.{domain}:6443",
+                "apiServerURL": f"https://api.{domain}:6443",
+                "platformStatus": {"baremetal": {
+                    "apiServerInternalIP": api_vip,
+                    "apiServerInternalIPs": [api_vip],
+                    "machineNetworks": ["192.168.221.0/24"],
+                }},
+            },
+        }
+        controllerconfig = {"spec": {"infra": infra}}
+        self.assertTrue(ct.compact_controllerconfig_infra_matches(
+            controllerconfig, domain, api_vip, subnet))
+        stale_controllerconfig = json.loads(json.dumps(controllerconfig))
+        stale_controllerconfig["spec"]["infra"]["status"]["apiServerInternalURI"] = (
+            "https://api-int.edge16-24g.redhat.com:6443")
+        self.assertFalse(ct.compact_controllerconfig_infra_matches(
+            stale_controllerconfig, domain, api_vip, subnet))
+
+        api_url = (
+            f"KUBERNETES_SERVICE_HOST='api-int.{domain}'\n"
+            "KUBERNETES_SERVICE_PORT='6443'\n")
+        source = "data:," + urllib.parse.quote(api_url, safe="")
+        machineconfig = {"spec": {"config": {"storage": {"files": [{
+            "path": "/etc/kubernetes/apiserver-url.env",
+            "contents": {"source": source},
+        }]}}}}
+        self.assertTrue(ct.compact_machineconfig_input_has_clone_api_url(
+            machineconfig, domain))
+        machineconfig["spec"]["config"]["storage"]["files"][0]["contents"]["source"] = (
+            "data:," + urllib.parse.quote(
+                "KUBERNETES_SERVICE_HOST='api-int.edge16-24g.redhat.com'\n", safe=""))
+        self.assertFalse(ct.compact_machineconfig_input_has_clone_api_url(
+            machineconfig, domain))
 
     def test_kubernetes_endpoint_check_rejects_stale_addresses(self):
         clone_ips = ["192.168.220.69", "192.168.220.81", "192.168.220.89"]
