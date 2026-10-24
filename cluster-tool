@@ -4431,8 +4431,6 @@ def _finish_compact_clone(
                     "Could not apply clone Infrastructure identity before MCO render"
                     + (f": {detail}" if detail else "")
                     + f". Log: {work}/clone.log")
-        _sync_compact_controllerconfig_identity(clone_oc, clone_id, subnet, work)
-
         _clone_log(work, "publish clone node addresses before MCO render")
         _publish_clone_addresses(clone_oc, nodes, pairs)
         pre_render_endpoints = _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work)
@@ -4550,6 +4548,11 @@ def _finish_compact_clone(
                 lambda: _inject_compact_pull_secret(clone_oc, work, pull_secret),
             ))
         _call_together(dict(preparation_steps))
+        # ControllerConfig embeds snapshots of both cluster-scoped identity
+        # resources. Sync it only after apply_identity_records has updated
+        # DNS/cluster; otherwise a fresh clone still has the source base domain
+        # and the guard correctly refuses to render.
+        _sync_compact_controllerconfig_identity(clone_oc, clone_id, subnet, work)
 
         # Kubelets need the clone internal API certificate to reconnect. The
         # cert-regeneration controller must also be restarted here, before MCO
