@@ -2335,6 +2335,41 @@ def compact_reload_apiserver_script():
         """)
 
 
+def compact_apiserver_host_ip_script(expected_ip):
+    """Refresh a kube-apiserver container that still advertises a source-node IP."""
+    expected = str(ipaddress.ip_address(expected_ip))
+    if not isinstance(ipaddress.ip_address(expected), ipaddress.IPv4Address):
+        raise ValueError("compact kube-apiserver host IP must be IPv4")
+    return textwrap.dedent(f"""\
+        set -euo pipefail
+        expected={shlex.quote(expected)}
+        deadline=$((SECONDS + 120))
+        restarted=0
+        while (( SECONDS < deadline )); do
+          for id in $(sudo crictl ps -q --name kube-apiserver 2>/dev/null || true); do
+            host_ip=$(sudo crictl inspect "$id" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); p=((d.get("info") or {{}}).get("runtimeSpec") or {{}}).get("process") or {{}}; print(next((v.split("=", 1)[1] for v in p.get("env") or [] if v.startswith("HOST_IP=")), ""))' || true)
+            [ -n "$host_ip" ] || continue
+            if [ "$host_ip" = "$expected" ]; then
+              if curl --silent --show-error --fail --insecure --connect-timeout 2 --max-time 4 \\
+                  --output /dev/null https://127.0.0.1:6443/readyz; then
+                echo "kube-apiserver HOST_IP=$host_ip is ready"
+                exit 0
+              fi
+              continue
+            fi
+            if [ "$restarted" -eq 0 ]; then
+              echo "restarting kube-apiserver container with stale HOST_IP=$host_ip"
+              sudo crictl stop "$id" >/dev/null
+              restarted=1
+            fi
+          done
+          sleep 2
+        done
+        echo "kube-apiserver did not become ready with HOST_IP=$expected"
+        exit 1
+        """)
+
+
 def compact_start_recert_node_script():
     """Start kubelet on the Recert node after Recert stopped it."""
     return textwrap.dedent("""\
@@ -2574,6 +2609,34 @@ def _recover_compact_api_certificates(oc, work, domain, api_ip, nodes, identity)
     """Install the clone certs, then refresh the cert controller and API VIP."""
     _ensure_api_certificates(oc, work, domain, api_ip, nodes, identity)
     _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity)
+
+
+def _ensure_compact_apiserver_host_ips(nodes, identity, work):
+    """Ensure each static kube-apiserver advertises its current clone node IP."""
+    _clone_log(work, "verify kube-apiserver runtime addresses match clone nodes")
+    for node in nodes:
+        result = _vm(
+            node["ip"], compact_apiserver_host_ip_script(node["ip"]), identity,
+            check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "HOST_IP verification failed").strip()
+            sys.exit(
+                f"kube-apiserver on {node['role']} did not become ready with clone IP "
+                f"{node['ip']}: {detail}. Log: {work}/clone.log")
+        _clone_log(work, f"kube-apiserver on {node['role']} advertises clone IP {node['ip']}")
+
+
+def _recover_compact_api_certificates_and_endpoints(
+    clone_oc, work, domain, api_ip, nodes, identity, etcd_image,
+):
+    """Refresh API certs and lease-backed endpoints before MCO waits on the API service."""
+    _recover_compact_api_certificates(clone_oc, work, domain, api_ip, nodes, identity)
+    _ensure_compact_apiserver_host_ips(nodes, identity, work)
+    _clear_compact_stale_master_leases(nodes, identity, etcd_image, work)
+    if _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work) is not True:
+        sys.exit(
+            "Kubernetes API endpoints did not converge after kube-apiserver identity refresh. "
+            f"Log: {work}/clone.log")
 
 
 def compact_lb_cert_script(hostname, ip, signer_dir, out_dir):
@@ -4133,8 +4196,8 @@ def _finish_compact_clone(
 
         parallel_results = _call_together({
             "render": resolve_master_render,
-            "api-certificates": lambda: _recover_compact_api_certificates(
-                clone_oc, work, domain, api_vip, nodes, identity),
+            "api-certificates": lambda: _recover_compact_api_certificates_and_endpoints(
+                clone_oc, work, domain, api_ip, nodes, identity, etcd_image),
         })
         rendered, raw_render_text = parallel_results["render"]
         desired_master_render, expected_api_url = compact_machineconfig_identity(

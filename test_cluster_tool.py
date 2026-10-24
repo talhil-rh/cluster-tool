@@ -1579,6 +1579,29 @@ class TestCompactInspect(unittest.TestCase):
                 "oc", "/work", "test-infra-cluster-aabbccdd.redhat.com", "192.168.200.5", [], "key")
         parallel.assert_not_called()
 
+    def test_apiserver_host_ip_repair_is_bounded_and_checks_readiness(self):
+        script = ct.compact_apiserver_host_ip_script("192.168.200.89")
+
+        self.assertIn('expected=192.168.200.89', script)
+        self.assertIn("sudo crictl inspect", script)
+        self.assertIn('sudo crictl stop "$id"', script)
+        self.assertIn('https://127.0.0.1:6443/readyz', script)
+        self.assertIn("deadline=$((SECONDS + 120))", script)
+        with self.assertRaises(ValueError):
+            ct.compact_apiserver_host_ip_script("not-an-ip")
+
+    def test_api_recovery_refreshes_host_ips_and_stale_leases_before_endpoints(self):
+        source = inspect.getsource(ct._recover_compact_api_certificates_and_endpoints)
+        certs = source.index("_recover_compact_api_certificates(")
+        host_ips = source.index("_ensure_compact_apiserver_host_ips(")
+        leases = source.index("_clear_compact_stale_master_leases(")
+        endpoints = source.index("_refresh_compact_kubernetes_endpoints(")
+        self.assertLess(certs, host_ips)
+        self.assertLess(host_ips, leases)
+        self.assertLess(leases, endpoints)
+        finish = inspect.getsource(ct._finish_compact_clone)
+        self.assertIn("_recover_compact_api_certificates_and_endpoints(", finish)
+
     def test_clone_copy_keeps_source_disks_and_reissues_etcd_certs(self):
         source_nodes = [
             {"role": role, "disks": [{"path": f"/var/lib/libvirt/images/mno-test2/{role}.qcow2"}]}
@@ -2195,7 +2218,10 @@ class TestCompactInspect(unittest.TestCase):
             3, True, [], [], True, endpoints_ready=False))
         finish = inspect.getsource(ct._finish_compact_clone)
         self.assertIn('"render": resolve_master_render', finish)
-        self.assertIn('"api-certificates": lambda: _recover_compact_api_certificates(', finish)
+        self.assertIn(
+            '"api-certificates": lambda: _recover_compact_api_certificates_and_endpoints(',
+            finish,
+        )
         recovery = inspect.getsource(ct._recover_compact_api_certificates)
         self.assertLess(recovery.index("_ensure_api_certificates"), recovery.index("_refresh_internal_api_certificate"))
         self.assertNotIn("time.sleep(30)", finish)
