@@ -1772,6 +1772,66 @@ class TestCompactInspect(unittest.TestCase):
             ct.compact_master_lease_etcd_command(
                 "quay.io/openshift/etcd:latest", nodes, "delete", "not-a-lease-key")
 
+    def test_compact_mco_lease_expiry_requires_a_valid_expired_lease(self):
+        now = ct.datetime.fromisoformat("2026-10-24T04:10:00+00:00")
+        expired = {
+            "spec": {
+                "holderIdentity": "source-controller",
+                "renewTime": "2026-10-24T04:00:00Z",
+                "leaseDurationSeconds": 137,
+            }
+        }
+        recent = {
+            "spec": {
+                "holderIdentity": "active-controller",
+                "renewTime": "2026-10-24T04:08:00Z",
+                "leaseDurationSeconds": 137,
+            }
+        }
+
+        self.assertTrue(ct.compact_lease_is_expired(expired, now))
+        self.assertFalse(ct.compact_lease_is_expired(recent, now))
+        self.assertFalse(ct.compact_lease_is_expired({"spec": {}}, now))
+        self.assertFalse(ct.compact_lease_is_expired("not-json", now))
+        self.assertEqual(
+            ct.COMPACT_MCO_CONTROLLER_LEASE,
+            ("openshift-machine-config-operator", "machine-config-controller"))
+
+    def test_compact_mco_lease_cleanup_deletes_only_expired_leases(self):
+        old_renew_time = (
+            ct.datetime.now(ct.timezone.utc) - ct.timedelta(days=1)).isoformat()
+        expired = json.dumps({
+            "spec": {
+                "holderIdentity": "source-controller",
+                "renewTime": old_renew_time,
+                "leaseDurationSeconds": 137,
+            }
+        })
+        get_after_delete = MagicMock(
+            returncode=1, stdout="", stderr="Error from server (NotFound): leases not found")
+        responses = [
+            MagicMock(returncode=0, stdout=expired, stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+            get_after_delete,
+        ]
+        mock_env = MagicMock()
+        mock_env.run.side_effect = responses
+        with patch.object(ct, "env", mock_env), \
+                patch.object(ct, "_clone_log") as clone_log:
+            ct._clear_expired_mco_controller_lease("oc --kubeconfig=clone.kubeconfig", "/work")
+
+        self.assertEqual(mock_env.run.call_count, 3)
+        self.assertIn(
+            "delete lease machine-config-controller", mock_env.run.call_args_list[1].args[0])
+        self.assertIn("--ignore-not-found", mock_env.run.call_args_list[1].args[0])
+        self.assertIn("verified removal", clone_log.call_args.args[1])
+
+    def test_compact_finish_clears_expired_mco_lease_before_mco_render(self):
+        source = inspect.getsource(ct._finish_compact_clone)
+        clear_lease = source.index("_clear_expired_mco_controller_lease(clone_oc, work)")
+        prepare_render = source.index("_wait_compact_machineconfig_source(clone_oc")
+        self.assertLess(clear_lease, prepare_render)
+
     def test_etcd_bundle_update_is_ordered_and_fail_closed(self):
         source = inspect.getsource(ct._finish_compact_clone)
         sign = source.index("sign kubelet certificates with the live CSR signer")
@@ -1904,7 +1964,15 @@ class TestCompactInspect(unittest.TestCase):
 
                 failed = _Env(rejected)
                 ct.env = failed
-                with self.assertRaises(SystemExit) as aborted:
+                with patch.object(ct, "_clear_compact_stale_master_leases"), \
+                        patch.object(
+                            ct,
+                            "_load_revision_baseline",
+                            side_effect=lambda _work, operator=None: (
+                                10 if operator == "kube-apiserver" else None
+                            ),
+                        ), \
+                        self.assertRaises(SystemExit) as aborted:
                     ct._finish_compact_clone(
                         {}, "edge10", nodes, "/id", work, "/crypto", "etcd", "cn",
                         "/plan", {}, "192.168.210.81", "/src", [], start_at="rewrite")
@@ -2161,7 +2229,8 @@ class TestCompactInspect(unittest.TestCase):
             missing = _Env("")
             ct.env = missing
             self.assertIsNone(ct._load_revision_baselines("/work"))
-            with self.assertRaises(SystemExit) as aborted:
+            with patch.object(ct, "_clear_compact_stale_master_leases"), \
+                    self.assertRaises(SystemExit) as aborted:
                 nodes = [
                     {"role": role, "ip": ip}
                     for role, ip in zip(
