@@ -2281,6 +2281,26 @@ def compact_node_ips_ready(rows, nodes):
     return all(found.get(role) == ip for role, ip in expected.items())
 
 
+def compact_mcd_pod_address_rows(raw):
+    """Read host-network machine-config-daemon pod addresses and readiness."""
+    doc = json.loads(raw)
+    rows = {}
+    for pod in doc.get("items") or []:
+        metadata = pod.get("metadata") or {}
+        name = metadata.get("name") or ""
+        if not name.startswith("machine-config-daemon-"):
+            continue
+        role = (pod.get("spec") or {}).get("nodeName") or ""
+        if not role:
+            continue
+        statuses = (pod.get("status") or {}).get("containerStatuses") or []
+        rows[role] = {
+            "ip": (pod.get("status") or {}).get("podIP") or "",
+            "ready": bool(statuses) and all(item.get("ready") is True for item in statuses),
+        }
+    return rows
+
+
 def parse_etcd_pods(text):
     """Count etcd static pods whose containers are all running."""
     ready = 0
@@ -2336,18 +2356,19 @@ def compact_reload_apiserver_script():
 
 
 def compact_apiserver_host_ip_script(expected_ip):
-    """Refresh a kube-apiserver container that still advertises a source-node IP."""
+    """Refresh a static kube-apiserver manifest that retains a source-node IP."""
     expected = str(ipaddress.ip_address(expected_ip))
     if not isinstance(ipaddress.ip_address(expected), ipaddress.IPv4Address):
         raise ValueError("compact kube-apiserver host IP must be IPv4")
-    return textwrap.dedent(f"""\
+    script = textwrap.dedent("""\
         set -euo pipefail
-        expected={shlex.quote(expected)}
-        deadline=$((SECONDS + 120))
-        restarted=0
+        expected=@@EXPECTED@@
+        manifest=/etc/kubernetes/manifests/kube-apiserver-pod.yaml
+        deadline=$((SECONDS + 240))
+        manifest_updated=0
         while (( SECONDS < deadline )); do
           for id in $(sudo crictl ps -q --name kube-apiserver 2>/dev/null || true); do
-            host_ip=$(sudo crictl inspect "$id" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); p=((d.get("info") or {{}}).get("runtimeSpec") or {{}}).get("process") or {{}}; print(next((v.split("=", 1)[1] for v in p.get("env") or [] if v.startswith("HOST_IP=")), ""))' || true)
+            host_ip=$(sudo crictl inspect "$id" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); p=((d.get("info") or {}).get("runtimeSpec") or {}).get("process") or {}; print(next((v.split("=", 1)[1] for v in p.get("env") or [] if v.startswith("HOST_IP=")), ""))' || true)
             [ -n "$host_ip" ] || continue
             if [ "$host_ip" = "$expected" ]; then
               if curl --silent --show-error --fail --insecure --connect-timeout 2 --max-time 4 \\
@@ -2357,10 +2378,11 @@ def compact_apiserver_host_ip_script(expected_ip):
               fi
               continue
             fi
-            if [ "$restarted" -eq 0 ]; then
-              echo "restarting kube-apiserver container with stale HOST_IP=$host_ip"
-              sudo crictl stop "$id" >/dev/null
-              restarted=1
+            if [ "$manifest_updated" -eq 0 ]; then
+              echo "updating kube-apiserver static pod HOST_IP from $host_ip to $expected"
+              sudo python3 -c 'import json,os,pathlib,stat,sys; p=pathlib.Path(sys.argv[1]); s=p.stat(); d=json.loads(p.read_text()); c=next(x for x in d["spec"]["containers"] if x.get("name")=="kube-apiserver"); e=next(x for x in c["env"] if x.get("name")=="HOST_IP"); e.pop("valueFrom",None); e["value"]=sys.argv[2]; t=p.with_name(p.name+".cluster-tool-tmp"); t.write_text(json.dumps(d,separators=(",",":"))+"\\n"); os.chown(t,s.st_uid,s.st_gid); os.chmod(t,stat.S_IMODE(s.st_mode)); os.replace(t,p)' "$manifest" "$expected"
+              sudo restorecon -F "$manifest"
+              manifest_updated=1
             fi
           done
           sleep 2
@@ -2368,6 +2390,7 @@ def compact_apiserver_host_ip_script(expected_ip):
         echo "kube-apiserver did not become ready with HOST_IP=$expected"
         exit 1
         """)
+    return script.replace("@@EXPECTED@@", shlex.quote(expected))
 
 
 def compact_start_recert_node_script():
@@ -2611,6 +2634,47 @@ def _recover_compact_api_certificates(oc, work, domain, api_ip, nodes, identity)
     _refresh_internal_api_certificate(oc, work, domain, api_ip, nodes, identity)
 
 
+def _ensure_compact_mcd_pod_addresses(clone_oc, nodes, identity, work):
+    """Refresh host-network MCD pods that retained source-node addresses."""
+    _clone_log(work, "verify machine-config-daemon host addresses match clone nodes")
+
+    def observe(role):
+        result = env.run(
+            f"{clone_oc} get pods -n openshift-machine-config-operator -o json", check=False)
+        if result.returncode != 0 or not (result.stdout or "").strip():
+            return None
+        try:
+            return compact_mcd_pod_address_rows(result.stdout).get(role)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    for node in nodes:
+        state = observe(node["role"])
+        if state and state["ip"] == node["ip"] and state["ready"]:
+            _clone_log(work, f"machine-config-daemon on {node['role']} already uses clone IP {node['ip']}")
+            continue
+
+        _clone_log(work, f"restart {node['role']} kubelet to refresh its host-network pod IP")
+        restarted = _vm(node["ip"], "sudo systemctl restart kubelet", identity, check=False)
+        if restarted.returncode != 0:
+            detail = (restarted.stderr or restarted.stdout or "kubelet restart failed").strip()
+            sys.exit(
+                f"Could not refresh host-network pods on {node['role']}: {detail}. "
+                f"Log: {work}/clone.log")
+
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            state = observe(node["role"])
+            if state and state["ip"] == node["ip"] and state["ready"]:
+                _clone_log(work, f"machine-config-daemon on {node['role']} uses clone IP {node['ip']}")
+                break
+            time.sleep(2)
+        else:
+            sys.exit(
+                f"machine-config-daemon on {node['role']} did not become Ready with clone IP "
+                f"{node['ip']}. Log: {work}/clone.log")
+
+
 def _ensure_compact_apiserver_host_ips(nodes, identity, work):
     """Ensure each static kube-apiserver advertises its current clone node IP."""
     _clone_log(work, "verify kube-apiserver runtime addresses match clone nodes")
@@ -2631,6 +2695,7 @@ def _recover_compact_api_certificates_and_endpoints(
 ):
     """Refresh API certs and lease-backed endpoints before MCO waits on the API service."""
     _recover_compact_api_certificates(clone_oc, work, domain, api_ip, nodes, identity)
+    _ensure_compact_mcd_pod_addresses(clone_oc, nodes, identity, work)
     _ensure_compact_apiserver_host_ips(nodes, identity, work)
     _clear_compact_stale_master_leases(nodes, identity, etcd_image, work)
     if _refresh_compact_kubernetes_endpoints(clone_oc, nodes, work) is not True:

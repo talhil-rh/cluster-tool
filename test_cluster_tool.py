@@ -1584,19 +1584,55 @@ class TestCompactInspect(unittest.TestCase):
 
         self.assertIn('expected=192.168.200.89', script)
         self.assertIn("sudo crictl inspect", script)
-        self.assertIn('sudo crictl stop "$id"', script)
+        self.assertIn("/etc/kubernetes/manifests/kube-apiserver-pod.yaml", script)
+        self.assertIn('e.pop("valueFrom",None)', script)
+        self.assertIn('e["value"]=sys.argv[2]', script)
+        self.assertIn('sudo restorecon -F "$manifest"', script)
+        self.assertNotIn('sudo crictl stop "$id"', script)
         self.assertIn('https://127.0.0.1:6443/readyz', script)
-        self.assertIn("deadline=$((SECONDS + 120))", script)
+        self.assertIn("deadline=$((SECONDS + 240))", script)
         with self.assertRaises(ValueError):
             ct.compact_apiserver_host_ip_script("not-an-ip")
+
+    def test_compact_mcd_pod_address_rows_read_host_network_identity_and_readiness(self):
+        raw = json.dumps({"items": [
+            {
+                "metadata": {"name": "machine-config-daemon-a"},
+                "spec": {"nodeName": "master-0-0"},
+                "status": {"podIP": "192.168.200.69", "containerStatuses": [
+                    {"ready": True}, {"ready": True},
+                ]},
+            },
+            {
+                "metadata": {"name": "other-daemon"},
+                "spec": {"nodeName": "master-0-1"},
+                "status": {"podIP": "192.168.200.81", "containerStatuses": [
+                    {"ready": True},
+                ]},
+            },
+            {
+                "metadata": {"name": "machine-config-daemon-b"},
+                "spec": {"nodeName": "master-0-2"},
+                "status": {"podIP": "192.168.123.50", "containerStatuses": [
+                    {"ready": True}, {"ready": False},
+                ]},
+            },
+        ]})
+
+        self.assertEqual(ct.compact_mcd_pod_address_rows(raw), {
+            "master-0-0": {"ip": "192.168.200.69", "ready": True},
+            "master-0-2": {"ip": "192.168.123.50", "ready": False},
+        })
 
     def test_api_recovery_refreshes_host_ips_and_stale_leases_before_endpoints(self):
         source = inspect.getsource(ct._recover_compact_api_certificates_and_endpoints)
         certs = source.index("_recover_compact_api_certificates(")
+        mcd_ips = source.index("_ensure_compact_mcd_pod_addresses(")
         host_ips = source.index("_ensure_compact_apiserver_host_ips(")
         leases = source.index("_clear_compact_stale_master_leases(")
         endpoints = source.index("_refresh_compact_kubernetes_endpoints(")
         self.assertLess(certs, host_ips)
+        self.assertLess(mcd_ips, host_ips)
         self.assertLess(host_ips, leases)
         self.assertLess(leases, endpoints)
         finish = inspect.getsource(ct._finish_compact_clone)
